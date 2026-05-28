@@ -83,6 +83,25 @@ class FallbackClassifier:
         "bug",
         "wrong",
         "poor",
+        "missed",
+        "missing",
+        "lacked",
+        "lacking",
+        "flat",
+        "cold",
+        "not warm",
+        "not cozy",
+        "vibe",
+        "atmosphere",
+        "emotionally",
+        "sharpness",
+        "material",
+        "materials",
+        "reflection",
+        "reflections",
+        "proportion",
+        "proportions",
+        "product quality",
         "crash",
         "crashed",
         "freeze",
@@ -124,6 +143,23 @@ class FallbackClassifier:
         "realistic",
         "unrealistic",
         "sober",
+        "vibe",
+        "atmosphere",
+        "emotionally",
+        "warm",
+        "cozy",
+        "cinematic",
+        "alive",
+        "flat",
+        "sharpness",
+        "material",
+        "materials",
+        "reflection",
+        "reflections",
+        "proportion",
+        "proportions",
+        "product quality",
+        "luxury product",
     }
     USABILITY_HINTS = {"hard", "confusing", "confused", "ui", "ux", "difficult", "unclear", "find", "navigation", "use"}
 
@@ -218,6 +254,8 @@ class FallbackClassifier:
 
         if "realistic" in lower and any(token in lower for token in {"more realistic", "not realistic", "unrealistic"}):
             tag_hint = "lack_of_realism"
+        elif any(token in lower for token in {"missed the vibe", "not emotionally warm", "not warm", "not cozy", "felt flat"}):
+            tag_hint = "emotional_tone_mismatch"
         else:
             tag_hint = None
 
@@ -275,6 +313,14 @@ class FallbackClassifier:
             add("visual_style_feedback")
         if any(token in normalized for token in {"sober", "tone down", "less flashy"}):
             add("visual_tone_adjustment")
+        if any(token in normalized for token in {"missed the vibe", "not emotionally warm", "not warm", "not cozy", "felt flat"}):
+            add("emotional_tone_mismatch")
+        if any(token in normalized for token in {"cinematic and alive", "real cafe", "movie"}):
+            add("cinematic_atmosphere_request")
+        if any(token in normalized for token in {"sharpness", "blurry", "material", "materials", "reflections", "proportions", "product quality"}):
+            add("technical_product_realism")
+        if any(token in normalized for token in {"tropical island", "aerial", "drone", "environmental scale", "water texture", "water textures", "perspective"}):
+            add("environmental_aerial_realism")
 
         return tags[:8]
 
@@ -290,9 +336,32 @@ class FallbackClassifier:
         existing_suggestions: list[str],
         previous_followups: list[str],
         detected_issue_type: str,
+        grounding_context: str = "",
     ) -> HumanFollowupQuestionResult:
         normalized_feedback = user_feedback.lower()
-        if detected_issue_type == "technical":
+        style_mismatch = cls._grounding_mismatch(grounding_context, "style")
+        lighting_mismatch = cls._grounding_mismatch(grounding_context, "lighting")
+        tone_mismatch = cls._grounding_mismatch(grounding_context, "tone")
+        emotional_mismatch = cls._grounding_mismatch(grounding_context, "emotional_tone")
+        quality_mismatch = cls._grounding_mismatch(grounding_context, "quality")
+        if "latest_user_correction=technical realism" in grounding_context.lower():
+            question = "So this was a technical realism issue rather than an atmosphere issue?"
+        elif emotional_mismatch:
+            expected, _ = emotional_mismatch
+            question = f"So the emotional tone needed to feel more {expected}?"
+        elif style_mismatch:
+            expected, _ = style_mismatch
+            question = f"So the style felt wrong because you wanted {expected}?"
+        elif lighting_mismatch:
+            expected, _ = lighting_mismatch
+            question = f"You wanted the lighting closer to {expected}?"
+        elif tone_mismatch:
+            expected, _ = tone_mismatch
+            question = f"So the tone shifted away from {expected}?"
+        elif quality_mismatch:
+            expected, _ = quality_mismatch
+            question = f"Was the main issue that it needed {expected}?"
+        elif detected_issue_type == "technical":
             question = "What happened right before it failed?"
         elif detected_issue_type == "quality":
             question = f"What felt most off about the {task_type or 'result'}?"
@@ -311,6 +380,18 @@ class FallbackClassifier:
             question = "What one detail should we capture next?"
 
         return HumanFollowupQuestionResult(questions=[question])
+
+    @staticmethod
+    def _grounding_mismatch(grounding_context: str, category: str) -> tuple[str, str] | None:
+        marker = f"{category}: wanted "
+        normalized = grounding_context.lower()
+        if marker not in normalized or ", got " not in normalized:
+            return None
+
+        rest = normalized.split(marker, 1)[1]
+        expected, observed_part = rest.split(", got ", 1)
+        observed = observed_part.split("'", 1)[0].split("]", 1)[0].strip()
+        return expected.strip(), observed
 
     @classmethod
     def generate_feedback_insights(

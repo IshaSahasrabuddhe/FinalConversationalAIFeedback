@@ -15,9 +15,10 @@ Rules:
 - Mark intent as "rating" only when the message is mainly a score such as "3", "I'd rate it 4", or "2/5".
 - Mark intent as "off_topic" when it does not contribute feedback or rating.
 - If the message contains both feedback and rating, prefer intent="feedback".
+- Treat emotional mismatch, missing vibe, warmth, mood, tone, realism, or atmosphere as feedback.
 - Choose issue_type="technical" for crashes, freezing, delays, failed actions, or broken behavior.
 - Choose issue_type="usability" for confusing flows, difficult UI, unclear steps, navigation problems, or hard-to-use interactions.
-- Choose issue_type="quality" for unrealistic, inaccurate, low-quality, incomplete, irrelevant, or incorrect output.
+- Choose issue_type="quality" for unrealistic, inaccurate, low-quality, incomplete, irrelevant, incorrect output, or missed emotional tone.
 - Choose issue_type="none" if no clear issue type is present.
 
 User message: {message}
@@ -77,6 +78,7 @@ Extraction rules:
 - Capture multiple insights from one message.
 - Ignore noise or irrelevant filler.
 - Use short concrete phrases grounded in the user's wording.
+- Treat "wanted", "missed the vibe", "not warm/cozy", "felt flat", and similar emotional/tone gaps as negatives or suggestions even when phrased softly.
 - issue_tags must be snake_case, specific, reusable, 2 to 4 words when possible, and non-duplicated.
 - issue_tags should describe root issues or requested changes, not emotions.
 - Tags must align with negatives and suggestions.
@@ -133,6 +135,7 @@ Context:
 - existing_suggestions: {existing_suggestions}
 - previous_followups: {previous_followups}
 - detected_issue_type: {detected_issue_type}
+- grounding_context: {grounding_context}
 
 Rules:
 - Return exactly 1 question.
@@ -140,6 +143,14 @@ Rules:
 - Sound human and conversational.
 - Do not repeat or closely paraphrase previous_followups.
 - Adapt to task_type and any mismatch between prompt and output.
+- If grounding_context names a likely mismatch, ask about that concrete mismatch first.
+- If grounding_context includes an active_thread or unresolved_mismatches, continue that same thread.
+- If grounding_context includes latest_user_correction, treat it as higher priority than earlier context.
+- If grounding_context includes current_domain, keep the response inside that domain.
+- Do not reuse anything listed in do_not_reuse_invalidated_threads.
+- Prefer confirming a specific mismatch over generic questions like "what felt off?"
+- Do not ask usability/confusion questions unless the user actually mentioned confusion, navigation, or steps.
+- Do not ask another question just to reconfirm something already clear from context.
 - Ask for one useful missing detail, not multiple questions.
 - Avoid greetings, preambles, and lists.
 """

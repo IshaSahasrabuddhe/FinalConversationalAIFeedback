@@ -193,6 +193,17 @@ class ChatService:
         self._set_context_value(conversation, "active_issue_type", issue.issue_type)
         self._set_context_value(conversation, "last_issue_tags", extracted.issue_tags)
         self._set_context_value(conversation, "last_sentiment", extracted.sentiment)
+        self._update_grounding_memory(conversation, user_input, extracted)
+
+        completion_reply = self._maybe_complete_active_thread(
+            conversation=conversation,
+            user_input=user_input,
+            extracted=extracted,
+            previous_state=previous_state,
+        )
+        if completion_reply:
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            return self._respond(conversation, completion_reply)
 
         contextual_follow_up = self._maybe_build_contextual_follow_up(
             conversation=conversation,
@@ -205,11 +216,29 @@ class ChatService:
             conversation.state = ConversationState.ISSUE_HANDLING
             base_reply = contextual_follow_up
         elif self._get_context_value(conversation, "rating") is None:
-            conversation.state = ConversationState.ASK_RATING
-            base_reply = self._build_rating_prompt()
+            if self._get_context_value(conversation, "rating_prompt_asked", False):
+                conversation.state = ConversationState.FEEDBACK_CONTINUE
+                base_reply = self._build_progressive_acknowledgement(conversation)
+            else:
+                conversation.state = ConversationState.ASK_RATING
+                self._set_context_value(conversation, "rating_prompt_asked", True)
+                base_reply = self._build_rating_prompt()
         else:
             conversation.state = ConversationState.FEEDBACK_CONTINUE
             base_reply = self._build_continue_prompt(conversation, extracted)
+
+        if (
+            conversation.state != ConversationState.ASK_RATING
+            and "?" in base_reply
+            and not self._question_has_high_value(
+                conversation=conversation,
+                question=base_reply,
+                extracted=extracted,
+                user_feedback=user_input,
+                issue_type=issue.issue_type,
+            )
+        ):
+            base_reply = self._build_progressive_acknowledgement(conversation)
 
         reply = self._append_human_followup_if_needed(
             conversation=conversation,
@@ -286,6 +315,17 @@ class ChatService:
                 "entry_count": 0,
                 "follow_ups_asked": [],
                 "human_followups_asked": [],
+                "stated_preferences": [],
+                "contextual_mismatches": [],
+                "unresolved_mismatches": [],
+                "active_thread": "",
+                "completed_threads": [],
+                "thread_evidence": [],
+                "thread_turn_counts": {},
+                "repeated_completed_thread": "",
+                "invalidated_threads": [],
+                "latest_correction": "",
+                "current_domain": "",
             },
         )
 
@@ -297,6 +337,12 @@ class ChatService:
             memory["issue_types"].append(issue_type)
         memory["sentiments"].append(sentiment)
         memory["entry_count"] += 1
+        memory.setdefault("completed_threads", [])
+        memory.setdefault("thread_evidence", [])
+        memory.setdefault("thread_turn_counts", {})
+        memory.setdefault("repeated_completed_thread", "")
+        memory.setdefault("invalidated_threads", [])
+        memory.setdefault("latest_correction", "")
 
         context["feedback_captured"] = memory["entry_count"] > 0
         context["issue_type"] = self._resolve_issue_type_from_memory(memory)
@@ -326,6 +372,7 @@ class ChatService:
             "last_sentiment": "mixed",
             "feedback_captured": False,
             "metadata_locked": False,
+            "rating_prompt_asked": False,
             "feedback_memory": {
                 "positives": [],
                 "negatives": [],
@@ -336,8 +383,599 @@ class ChatService:
                 "entry_count": 0,
                 "follow_ups_asked": [],
                 "human_followups_asked": [],
+                "stated_preferences": [],
+                "contextual_mismatches": [],
+                "unresolved_mismatches": [],
+                "active_thread": "",
+                "completed_threads": [],
+                "thread_evidence": [],
+                "thread_turn_counts": {},
+                "repeated_completed_thread": "",
+                "invalidated_threads": [],
+                "latest_correction": "",
+                "current_domain": "",
             },
         }
+
+    def _update_grounding_memory(
+        self,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+    ) -> None:
+        context = self._conversation_context(conversation)
+        memory = context.setdefault("feedback_memory", self._default_context()["feedback_memory"])
+        memory.setdefault("completed_threads", [])
+        memory.setdefault("thread_evidence", [])
+        memory.setdefault("thread_turn_counts", {})
+        memory["repeated_completed_thread"] = ""
+        memory.setdefault("invalidated_threads", [])
+        memory.setdefault("latest_correction", "")
+        memory.setdefault("current_domain", "")
+
+        current_domain = self._detect_conversation_domain(user_input)
+        if not current_domain:
+            current_domain = self._detect_conversation_domain(" ".join([conversation.prompt or "", conversation.ai_output or ""]))
+        if current_domain:
+            self._reset_stale_thread_context_if_domain_changed(memory, current_domain)
+
+        correction = self._detect_user_correction(user_input)
+        if correction:
+            self._apply_user_correction_to_memory(memory, correction)
+
+        intent_traits = self._extract_context_traits(" ".join([conversation.prompt or "", user_input]))
+        output_traits = self._extract_context_traits(conversation.ai_output or "")
+        stated_preferences = self._format_traits(intent_traits)
+        if stated_preferences:
+            memory["stated_preferences"] = self._merge_limited(
+                memory.get("stated_preferences", []),
+                stated_preferences,
+                limit=8,
+            )
+
+        mismatches = self._detect_context_mismatches(intent_traits, output_traits, extracted)
+        if mismatches:
+            open_mismatches = [item for item in mismatches if item not in memory.get("completed_threads", [])]
+            memory["contextual_mismatches"] = self._merge_limited(
+                memory.get("contextual_mismatches", []),
+                mismatches,
+                limit=6,
+            )
+            if open_mismatches:
+                memory["unresolved_mismatches"] = self._merge_limited(
+                    memory.get("unresolved_mismatches", []),
+                    open_mismatches,
+                    limit=4,
+                )
+                memory["active_thread"] = open_mismatches[-1]
+            else:
+                memory["repeated_completed_thread"] = mismatches[-1]
+        elif self._is_dissatisfaction_about_active_thread(user_input, memory):
+            memory["active_thread"] = list(memory.get("unresolved_mismatches", []))[-1]
+
+        active_thread = memory.get("active_thread")
+        if active_thread:
+            thread_counts = dict(memory.get("thread_turn_counts", {}))
+            thread_counts[active_thread] = int(thread_counts.get(active_thread, 0)) + 1
+            memory["thread_turn_counts"] = thread_counts
+
+        issue_terms = self._extract_issue_terms(user_input, extracted)
+        if issue_terms:
+            memory["thread_evidence"] = self._merge_limited(
+                memory.get("thread_evidence", []),
+                issue_terms,
+                limit=16,
+            )
+
+        context["feedback_memory"] = memory
+        conversation.context = context
+
+    def _detect_conversation_domain(self, text: str) -> str:
+        normalized = text.lower()
+        domain_tokens = {
+            "environmental_aerial_realism": {
+                "island",
+                "tropical",
+                "aerial",
+                "drone",
+                "water",
+                "ocean",
+                "coast",
+                "coastline",
+                "environmental",
+                "scale",
+                "perspective",
+                "terrain",
+                "texture",
+                "textures",
+            },
+            "technical_product_realism": {
+                "watch",
+                "product",
+                "luxury",
+                "advertisement",
+                "metal",
+                "metallic",
+                "material",
+                "materials",
+                "reflection",
+                "reflections",
+                "sharpness",
+                "proportion",
+                "proportions",
+            },
+            "emotional_scene_realism": {
+                "cafe",
+                "cinematic",
+                "movie",
+                "character",
+                "woman",
+                "emotion",
+                "emotional",
+                "warm",
+                "cozy",
+                "atmosphere",
+                "immersive",
+                "alive",
+            },
+        }
+
+        best_domain = ""
+        best_score = 0
+        for domain, tokens in domain_tokens.items():
+            score = sum(1 for token in tokens if token in normalized)
+            if score > best_score:
+                best_domain = domain
+                best_score = score
+        return best_domain if best_score >= 2 else ""
+
+    def _reset_stale_thread_context_if_domain_changed(self, memory: dict, current_domain: str) -> None:
+        previous_domain = str(memory.get("current_domain") or "")
+        if previous_domain == current_domain:
+            return
+
+        memory["current_domain"] = current_domain
+        if not previous_domain:
+            return
+
+        memory["active_thread"] = ""
+        memory["unresolved_mismatches"] = []
+        memory["completed_threads"] = []
+        memory["contextual_mismatches"] = []
+        memory["thread_evidence"] = []
+        memory["thread_turn_counts"] = {}
+        memory["repeated_completed_thread"] = ""
+        memory["invalidated_threads"] = []
+        memory["latest_correction"] = ""
+        memory["human_followups_asked"] = []
+        memory["follow_ups_asked"] = []
+        memory["stated_preferences"] = []
+
+    def _build_grounding_context(
+        self,
+        conversation: Conversation,
+        user_feedback: str,
+        extracted: FeedbackExtraction,
+    ) -> str:
+        prompt = conversation.prompt or ""
+        ai_output = conversation.ai_output or ""
+        if not prompt and not ai_output:
+            return ""
+
+        context = self._conversation_context(conversation)
+        memory = context.get("feedback_memory", {})
+        intent_traits = self._extract_context_traits(" ".join([prompt, user_feedback]))
+        output_traits = self._extract_context_traits(ai_output)
+        current_mismatches = self._detect_context_mismatches(intent_traits, output_traits, extracted)
+        stored_mismatches = list(memory.get("contextual_mismatches", []))
+
+        sections: list[str] = []
+        if intent_traits:
+            sections.append(f"intent_traits={self._format_traits(intent_traits)}")
+        if output_traits:
+            sections.append(f"output_traits={self._format_traits(output_traits)}")
+
+        mismatches = self._merge_limited(stored_mismatches, current_mismatches, limit=4)
+        if mismatches:
+            sections.append(f"likely_mismatches={mismatches}")
+
+        unresolved = list(memory.get("unresolved_mismatches", []))[-4:]
+        if unresolved:
+            sections.append(f"unresolved_mismatches={unresolved}")
+
+        active_thread = memory.get("active_thread")
+        if active_thread:
+            sections.append(f"active_thread={active_thread}")
+
+        latest_correction = memory.get("latest_correction")
+        if latest_correction:
+            sections.append(f"latest_user_correction={latest_correction}")
+
+        current_domain = memory.get("current_domain")
+        if current_domain:
+            sections.append(f"current_domain={current_domain}")
+
+        invalidated = list(memory.get("invalidated_threads", []))[-4:]
+        if invalidated:
+            sections.append(f"do_not_reuse_invalidated_threads={invalidated}")
+
+        preferences = list(memory.get("stated_preferences", []))[-4:]
+        if preferences:
+            sections.append(f"already_stated_preferences={preferences}")
+
+        return " | ".join(sections)
+
+    def _extract_context_traits(self, text: str) -> dict[str, list[str]]:
+        normalized = text.lower()
+        trait_map = {
+            "style": [
+                (("realistic", "photorealistic", "photo-realistic", "realism"), "realistic"),
+                (("cinematic", "film still", "movie-like"), "cinematic"),
+                (("anime", "cartoon", "cartoonish", "animated"), "anime/cartoon"),
+                (("illustration", "sketch", "drawing"), "illustrative"),
+            ],
+            "lighting": [
+                (("natural lighting", "natural light"), "natural lighting"),
+                (("soft lighting", "soft light"), "soft lighting"),
+                (("flat lighting", "flat light"), "flat lighting"),
+                (("harsh lighting", "harsh light"), "harsh lighting"),
+                (("overexposed", "too bright"), "overexposed"),
+                (("dark", "underexposed"), "too dark"),
+            ],
+            "tone": [
+                (("serious", "professional", "sober"), "serious"),
+                (("playful", "flashy", "exaggerated"), "playful/exaggerated"),
+            ],
+            "emotional_tone": [
+                (("warm", "cozy", "cosy", "alive", "emotional warmth"), "warm/cozy/alive"),
+                (("cinematic", "movie", "film", "real cafe"), "cinematic realism"),
+                (("flat", "cold", "lifeless", "not emotionally warm", "not warm", "not cozy", "missed the vibe"), "emotionally flat"),
+            ],
+            "quality": [
+                (("detailed", "sharp", "high quality"), "high detail"),
+                (("blurry", "low quality", "distorted", "unrealistic"), "low quality"),
+            ],
+            "composition": [
+                (("portrait", "close-up", "close up"), "portrait"),
+                (("full body", "wide shot"), "wide composition"),
+                (("centered", "symmetrical"), "centered"),
+            ],
+            "color": [
+                (("warm", "golden"), "warm color"),
+                (("cool", "blue tone"), "cool color"),
+                (("muted", "subtle"), "muted color"),
+                (("vibrant", "saturated"), "vibrant color"),
+            ],
+        }
+
+        traits: dict[str, list[str]] = {}
+        for category, patterns in trait_map.items():
+            for keywords, label in patterns:
+                if any(keyword in normalized for keyword in keywords):
+                    traits.setdefault(category, [])
+                    if label not in traits[category]:
+                        traits[category].append(label)
+        return traits
+
+    def _detect_context_mismatches(
+        self,
+        intent_traits: dict[str, list[str]],
+        output_traits: dict[str, list[str]],
+        extracted: FeedbackExtraction,
+    ) -> list[str]:
+        if not intent_traits:
+            return []
+
+        feedback_text = " ".join(extracted.negatives + extracted.suggestions + extracted.issue_tags).lower()
+        mismatches: list[str] = []
+        for category, expected_values in intent_traits.items():
+            observed_values = output_traits.get(category, [])
+            if not observed_values and category == "emotional_tone":
+                observed_values = self._infer_emotional_observed_values(feedback_text)
+            if not observed_values:
+                continue
+
+            expected = expected_values[0]
+            observed = observed_values[0]
+            if expected == observed:
+                continue
+
+            if self._is_meaningful_mismatch(category, expected, observed, feedback_text):
+                mismatches.append(f"{category}: wanted {expected}, got {observed}")
+
+        return mismatches[:4]
+
+    def _is_meaningful_mismatch(self, category: str, expected: str, observed: str, feedback_text: str) -> bool:
+        if expected in feedback_text or observed in feedback_text:
+            return True
+        if category == "style":
+            return ("realistic" in expected or "cinematic" in expected) and "anime/cartoon" in observed
+        if category == "lighting":
+            return expected in {"natural lighting", "soft lighting"} and observed in {
+                "flat lighting",
+                "harsh lighting",
+                "overexposed",
+                "too dark",
+            }
+        if category == "tone":
+            return expected == "serious" and observed == "playful/exaggerated"
+        if category == "emotional_tone":
+            return observed == "emotionally flat" and expected in {"warm/cozy/alive", "cinematic realism"}
+        if category == "quality":
+            return expected == "high detail" and observed == "low quality"
+        if category == "color":
+            return expected != observed
+        return False
+
+    def _infer_emotional_observed_values(self, feedback_text: str) -> list[str]:
+        if any(
+            token in feedback_text
+            for token in {
+                "missed the vibe",
+                "not emotionally warm",
+                "not warm",
+                "not cozy",
+                "not cosy",
+                "felt flat",
+                "emotionally it missed",
+                "lacked warmth",
+            }
+        ):
+            return ["emotionally flat"]
+        return []
+
+    def _is_dissatisfaction_about_active_thread(self, user_input: str, memory: dict) -> bool:
+        if not memory.get("unresolved_mismatches"):
+            return False
+        normalized = user_input.lower()
+        return any(
+            token in normalized
+            for token in {
+                "missed",
+                "not",
+                "flat",
+                "wanted",
+                "because",
+                "but",
+                "vibe",
+                "warm",
+                "cozy",
+                "cinematic",
+                "alive",
+                "atmosphere",
+            }
+        )
+
+    def _detect_user_correction(self, user_input: str) -> dict[str, str] | None:
+        normalized = user_input.lower()
+        correction_markers = {
+            "actually",
+            "rather than",
+            "instead",
+            "not emotional",
+            "not about emotion",
+            "not atmosphere",
+            "more technical",
+            "technical in this case",
+            "product quality",
+        }
+        if not any(marker in normalized for marker in correction_markers):
+            return None
+
+        if any(
+            marker in normalized
+            for marker in {
+                "technical",
+                "sharpness",
+                "blurry",
+                "material",
+                "materials",
+                "reflection",
+                "reflections",
+                "proportion",
+                "proportions",
+                "product quality",
+                "rendering quality",
+                "luxury product",
+            }
+        ):
+            return {
+                "invalidates": "emotional_tone",
+                "replacement": "technical_product_realism",
+                "summary": "technical realism and product rendering quality",
+            }
+
+        if any(marker in normalized for marker in {"emotional", "atmosphere", "mood", "vibe", "warmth"}):
+            return {
+                "invalidates": "technical_product_realism",
+                "replacement": "emotional_tone",
+                "summary": "emotional tone and atmosphere",
+            }
+
+        return {"invalidates": "", "replacement": "", "summary": ""}
+
+    def _apply_user_correction_to_memory(self, memory: dict, correction: dict[str, str]) -> None:
+        invalidates = correction.get("invalidates", "")
+        replacement = correction.get("replacement", "")
+        summary = correction.get("summary", "")
+
+        invalidated_threads = list(memory.get("invalidated_threads", []))
+        active_thread = str(memory.get("active_thread") or "")
+        completed_threads = list(memory.get("completed_threads", []))
+        unresolved = list(memory.get("unresolved_mismatches", []))
+
+        def is_invalidated(thread: str) -> bool:
+            return bool(invalidates and invalidates in thread)
+
+        stale_threads = [thread for thread in [active_thread, *completed_threads, *unresolved] if is_invalidated(thread)]
+        memory["invalidated_threads"] = self._merge_limited(invalidated_threads, stale_threads, limit=8)
+        memory["completed_threads"] = [thread for thread in completed_threads if not is_invalidated(thread)]
+        memory["unresolved_mismatches"] = [thread for thread in unresolved if not is_invalidated(thread)]
+        if is_invalidated(active_thread):
+            memory["active_thread"] = ""
+
+        if replacement:
+            replacement_thread = f"{replacement}: {summary}"
+            memory["active_thread"] = replacement_thread
+            memory["unresolved_mismatches"] = self._merge_limited(
+                memory.get("unresolved_mismatches", []),
+                [replacement_thread],
+                limit=4,
+            )
+
+        memory["latest_correction"] = summary or replacement
+
+    def _maybe_complete_active_thread(
+        self,
+        *,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+        previous_state: ConversationState,
+    ) -> str | None:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        active_thread = str(memory.get("active_thread") or "")
+        if not active_thread:
+            repeated_completed_thread = str(memory.get("repeated_completed_thread") or "")
+            if repeated_completed_thread and self._get_context_value(conversation, "rating") is not None:
+                self._clear_repeated_completed_thread(conversation)
+                return self._build_thread_summary_response(repeated_completed_thread)
+            return None
+
+        if self._get_context_value(conversation, "rating") is None and previous_state != ConversationState.ISSUE_HANDLING:
+            return None
+
+        if active_thread in memory.get("completed_threads", []):
+            self._mark_thread_completed(conversation, active_thread)
+            return self._build_thread_summary_response(active_thread)
+
+        completion_signal = self._is_completion_signal(user_input)
+        saturated = self._is_thread_saturated(active_thread, user_input, extracted, memory)
+        if not completion_signal and not saturated:
+            return None
+
+        self._mark_thread_completed(conversation, active_thread)
+        return self._build_thread_summary_response(active_thread)
+
+    def _is_completion_signal(self, user_input: str) -> bool:
+        normalized = user_input.strip().lower().strip(".!")
+        return normalized in {
+            "yes",
+            "yeah",
+            "yep",
+            "exactly",
+            "correct",
+            "right",
+            "that's it",
+            "thats it",
+            "that is it",
+            "i am done",
+            "i'm done",
+            "done",
+            "nothing else",
+            "no more",
+        }
+
+    def _is_thread_saturated(
+        self,
+        active_thread: str,
+        user_input: str,
+        extracted: FeedbackExtraction,
+        memory: dict,
+    ) -> bool:
+        issue_terms = self._extract_issue_terms(user_input, extracted)
+        evidence_terms = set(memory.get("thread_evidence", []))
+        thread_turn_count = int(dict(memory.get("thread_turn_counts", {})).get(active_thread, 0))
+        detail_count = len(evidence_terms)
+        repeated_terms = len(set(issue_terms) & evidence_terms)
+        word_count = len(user_input.split())
+
+        if word_count >= 24 and detail_count >= 5:
+            return True
+        if thread_turn_count >= 2 and detail_count >= 4:
+            return True
+        if thread_turn_count >= 2 and issue_terms and repeated_terms >= max(2, len(set(issue_terms)) - 1):
+            return True
+        return False
+
+    def _extract_issue_terms(self, user_input: str, extracted: FeedbackExtraction) -> list[str]:
+        normalized = " ".join(
+            [user_input, *extracted.negatives, *extracted.suggestions, *extracted.issue_tags]
+        ).lower()
+        term_map = {
+            "emotional_warmth": {"warm", "cozy", "cosy", "emotional warmth"},
+            "cinematic_atmosphere": {"cinematic", "movie", "film", "atmosphere", "immersive", "lived-in"},
+            "emotional_flatness": {"flat", "cold", "empty", "lifeless", "missed the vibe"},
+            "natural_human_feeling": {"natural", "real", "realism", "realistic", "human"},
+            "artificial_posing": {"artificial", "posed", "posing", "staged"},
+            "composition_worked": {"composition", "setting", "scene worked", "looked pretty", "visually"},
+            "missing_reflections": {"reflection", "reflections"},
+            "missing_steam": {"steam"},
+            "image_sharpness": {"sharpness", "sharp", "blurry", "blurred"},
+            "material_quality": {"material", "materials", "metallic", "metal", "texture"},
+            "distorted_proportions": {"proportion", "proportions", "distorted", "warped"},
+            "product_rendering_quality": {"product quality", "rendering quality", "luxury product", "advertisement"},
+            "environmental_scale": {"scale", "environmental scale", "island scale", "terrain"},
+            "aerial_perspective": {"aerial", "drone", "perspective", "drone photography"},
+            "water_texture_realism": {"water texture", "water textures", "ocean texture", "water"},
+            "island_realism": {"island", "tropical", "coast", "coastline"},
+            "lighting_mood": {"lighting", "rainy", "mood"},
+            "style_mismatch": {"style", "cartoon", "anime"},
+            "quality_gap": {"quality", "blurry", "distorted", "incorrect"},
+        }
+
+        terms: list[str] = []
+        for label, tokens in term_map.items():
+            if any(token in normalized for token in tokens):
+                terms.append(label)
+        return terms
+
+    def _mark_thread_completed(self, conversation: Conversation, active_thread: str) -> None:
+        context = self._conversation_context(conversation)
+        memory = context.setdefault("feedback_memory", self._default_context()["feedback_memory"])
+        memory["completed_threads"] = self._merge_limited(
+            memory.get("completed_threads", []),
+            [active_thread],
+            limit=8,
+        )
+        memory["unresolved_mismatches"] = [
+            item for item in list(memory.get("unresolved_mismatches", [])) if item != active_thread
+        ]
+        if memory.get("active_thread") == active_thread:
+            memory["active_thread"] = ""
+        memory["repeated_completed_thread"] = ""
+        context["feedback_memory"] = memory
+        conversation.context = context
+
+    def _clear_repeated_completed_thread(self, conversation: Conversation) -> None:
+        context = self._conversation_context(conversation)
+        memory = context.setdefault("feedback_memory", self._default_context()["feedback_memory"])
+        memory["repeated_completed_thread"] = ""
+        context["feedback_memory"] = memory
+        conversation.context = context
+
+    def _build_thread_summary_response(self, active_thread: str) -> str:
+        if "technical_product_realism:" in active_thread:
+            return "Understood. This was a technical realism issue: sharpness, materials, reflections, and proportions mattered most."
+        if "emotional_tone:" in active_thread:
+            return "That makes sense. Visually the scene had potential, but the emotional realism and immersion were missing."
+        if "style:" in active_thread:
+            return "Got it. The main gap was that the visual style did not match what you had in mind."
+        if "lighting:" in active_thread:
+            return "Understood. The lighting missed the mood you were aiming for."
+        if "tone:" in active_thread:
+            return "Got it. The tone shifted away from the feeling you wanted."
+        return "I think I understand the gap much more clearly now. This feedback is helpful."
+
+    def _format_traits(self, traits: dict[str, list[str]]) -> list[str]:
+        return [f"{category}: {', '.join(values)}" for category, values in traits.items() if values]
+
+    def _merge_limited(self, old_list, new_list, *, limit: int) -> list[str]:
+        merged: list[str] = []
+        for item in list(old_list or []) + list(new_list or []):
+            if item and item not in merged:
+                merged.append(item)
+        return merged[-limit:]
 
     def _feedback_count(self, conversation: Conversation) -> int:
         memory = self._conversation_context(conversation).get("feedback_memory", {})
@@ -469,21 +1107,44 @@ class ChatService:
         issue_type: str,
         previous_state: ConversationState,
     ) -> str | None:
-        if previous_state == ConversationState.ISSUE_HANDLING:
+        if previous_state == ConversationState.ISSUE_HANDLING and not self._has_unresolved_grounding_thread(conversation):
             return None
+
+        if self._get_context_value(conversation, "rating") is not None and self._has_unresolved_grounding_thread(conversation):
+            humanized = self._generate_human_follow_up(
+                conversation=conversation,
+                user_feedback=" ".join(extracted.negatives + extracted.suggestions + extracted.positives),
+                extracted=extracted,
+                issue_type=issue_type,
+            )
+            if humanized:
+                return humanized
+            grounded = self._build_grounded_thread_follow_up(conversation)
+            if grounded:
+                return grounded
 
         follow_up_key = self._choose_follow_up_key(extracted, issue_type)
         if not follow_up_key or self._was_follow_up_asked(conversation, follow_up_key):
             return None
 
         self._mark_follow_up_asked(conversation, follow_up_key)
+        fallback = self._build_follow_up_from_key(follow_up_key)
+        if not self._question_has_high_value(
+            conversation=conversation,
+            question=fallback,
+            extracted=extracted,
+            user_feedback=" ".join(extracted.negatives + extracted.suggestions + extracted.positives),
+            issue_type=issue_type,
+        ):
+            return None
+
         humanized = self._generate_human_follow_up(
             conversation=conversation,
             user_feedback=" ".join(extracted.negatives + extracted.suggestions + extracted.positives),
             extracted=extracted,
             issue_type=issue_type,
         )
-        return humanized or self._build_follow_up_from_key(follow_up_key)
+        return humanized or fallback
 
     def _choose_follow_up_key(self, extracted: FeedbackExtraction, issue_type: str) -> str | None:
         tags = set(extracted.issue_tags)
@@ -521,6 +1182,136 @@ class ChatService:
             "clarify": "Can you say a little more so I capture the useful part of that feedback?",
         }
         return prompts[key]
+
+    def _has_unresolved_grounding_thread(self, conversation: Conversation) -> bool:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        return bool(memory.get("unresolved_mismatches") or memory.get("active_thread"))
+
+    def _build_grounded_thread_follow_up(self, conversation: Conversation) -> str | None:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        active_thread = str(memory.get("active_thread") or "")
+        if not active_thread:
+            unresolved = list(memory.get("unresolved_mismatches", []))
+            active_thread = unresolved[-1] if unresolved else ""
+
+        if "emotional_tone:" in active_thread:
+            return "So the issue was more about emotional tone than image quality itself?"
+        if "style:" in active_thread:
+            return "So the main gap was the style not matching what you imagined?"
+        if "lighting:" in active_thread:
+            return "Was the lighting the biggest part that missed the intended mood?"
+        if "tone:" in active_thread:
+            return "So the tone shifted away from what you wanted?"
+        return None
+
+    def _question_has_high_value(
+        self,
+        *,
+        conversation: Conversation,
+        question: str,
+        extracted: FeedbackExtraction,
+        user_feedback: str,
+        issue_type: str,
+    ) -> bool:
+        if not question.strip() or "?" not in question:
+            return True
+
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        normalized = question.strip().lower()
+        previous_questions = [item.lower().strip() for item in memory.get("human_followups_asked", [])]
+        if normalized in previous_questions:
+            return False
+
+        if self._is_generic_survey_question(normalized) and self._has_rich_grounded_context(conversation, extracted, user_feedback):
+            return False
+
+        if "confusing" in normalized or "step" in normalized:
+            combined = " ".join([user_feedback, *extracted.negatives, *extracted.suggestions, *extracted.issue_tags]).lower()
+            if not any(token in combined for token in {"confusing", "confused", "step", "navigation", "hard to use", "unclear"}):
+                return False
+
+        active_thread = str(memory.get("active_thread") or "")
+        if active_thread and self._is_thread_saturated(active_thread, user_feedback, extracted, memory):
+            return False
+
+        completed_threads = list(memory.get("completed_threads", []))
+        if completed_threads and self._is_generic_survey_question(normalized):
+            return False
+
+        return True
+
+    def _is_generic_survey_question(self, normalized_question: str) -> bool:
+        generic_patterns = {
+            "what felt most off",
+            "what stood out as the main problem",
+            "which step felt",
+            "which part felt",
+            "what should have looked",
+            "what exactly happened",
+            "can you say a little more",
+            "could you share a little more",
+            "anything else",
+            "one more detail",
+            "another improvement",
+            "another change",
+            "another strong point",
+            "what would you expect the system to do differently",
+            "what one detail should we capture next",
+        }
+        return any(pattern in normalized_question for pattern in generic_patterns)
+
+    def _has_rich_grounded_context(
+        self,
+        conversation: Conversation,
+        extracted: FeedbackExtraction,
+        user_feedback: str,
+    ) -> bool:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        issue_terms = set(memory.get("thread_evidence", [])) | set(self._extract_issue_terms(user_feedback, extracted))
+        feedback_text = " ".join(
+            [
+                user_feedback,
+                " ".join(memory.get("negatives", [])),
+                " ".join(memory.get("suggestions", [])),
+                " ".join(memory.get("issue_tags", [])),
+            ]
+        )
+        return bool(
+            len(issue_terms) >= 4
+            or len(feedback_text.split()) >= 35
+            or memory.get("completed_threads")
+            or (memory.get("contextual_mismatches") and len(issue_terms) >= 3)
+        )
+
+    def _build_progressive_acknowledgement(self, conversation: Conversation) -> str:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        current_domain = str(memory.get("current_domain") or "")
+        active_thread = str(memory.get("active_thread") or "")
+        if not active_thread:
+            completed = list(memory.get("completed_threads", []))
+            active_thread = completed[-1] if completed else ""
+
+        if active_thread:
+            return self._build_thread_summary_response(active_thread)
+
+        if current_domain == "environmental_aerial_realism":
+            return "Understood. The scene had the right vacation idea, but the scale, perspective, and environmental realism felt artificial."
+
+        latest_correction = str(memory.get("latest_correction") or "")
+        if "technical realism" in latest_correction or "product rendering" in latest_correction:
+            return "Got it. This was more of a technical realism failure than a mood or atmosphere issue."
+
+        evidence = set(memory.get("thread_evidence", []))
+        if {"environmental_scale", "aerial_perspective", "water_texture_realism", "island_realism"} & evidence:
+            return "Understood. The realism issue was environmental believability: scale, aerial perspective, and natural water texture."
+        if current_domain == "technical_product_realism" and {"image_sharpness", "material_quality", "missing_reflections", "distorted_proportions"} & evidence:
+            return "Got it. The product needed sharper detail, stronger materials, cleaner reflections, and more realistic proportions."
+        invalidated = " ".join(memory.get("invalidated_threads", []))
+        if current_domain != "technical_product_realism" and "emotional_tone" not in invalidated and {"cinematic_atmosphere", "emotional_flatness"} & evidence:
+            return "Understood. The realism problem seems less technical and more emotional and atmospheric."
+        if {"natural_human_feeling", "artificial_posing"} & evidence:
+            return "Got it. The scene needed to feel more naturally lived-in and emotionally believable."
+        return "I think I understand the gap clearly now. This feedback is helpful."
 
     def _build_issue_follow_up(self, issue_type: str, issue_tags: list[str], detailed: bool) -> str:
         if "slow_response_time" in issue_tags:
@@ -623,6 +1414,7 @@ class ChatService:
         context = self._conversation_context(conversation)
         memory = context.get("feedback_memory", {})
         previous_followups = list(memory.get("human_followups_asked", []))
+        grounding_context = self._build_grounding_context(conversation, user_feedback, extracted)
         result = self.llm_service.generate_human_followup_question(
             task_type=conversation.task_type or "text",
             prompt=conversation.prompt or "",
@@ -632,9 +1424,18 @@ class ChatService:
             existing_suggestions=memory.get("suggestions", []),
             previous_followups=previous_followups,
             detected_issue_type=issue_type,
+            grounding_context=grounding_context,
         )
         question = next((item.strip() for item in result.questions if item.strip()), "")
         if not question or question in previous_followups:
+            return None
+        if not self._question_has_high_value(
+            conversation=conversation,
+            question=question,
+            extracted=extracted,
+            user_feedback=user_feedback,
+            issue_type=issue_type,
+        ):
             return None
 
         memory["human_followups_asked"] = previous_followups + [question]
