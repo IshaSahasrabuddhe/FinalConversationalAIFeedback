@@ -126,10 +126,29 @@ class ChatService:
         if self._is_user_declining(user_input):
             conversation.state = ConversationState.END
             self._log_state("end", conversation, user_input)
-            return self._respond(conversation, "Understood. I will pause here. If you think of anything else later, just send it.")
+            return self._respond(
+                conversation,
+                "Understood. I will pause this feedback for now. Let me know if you would like to add anything later.",
+            )
+
+        if self._is_confirmation_signal(user_input) and self._has_feedback_context(conversation):
+            self._mark_active_thread_completed_if_present(conversation)
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_state("confirmation", conversation, user_input)
+            return self._respond(conversation, self._build_confirmation_continue_response(conversation))
 
         if previous_state == ConversationState.START:
             return self._advance_without_user_message(conversation)
+
+        if self._is_off_topic_question(user_input):
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_state("off_topic", conversation, user_input)
+            return self._respond(conversation, self._build_off_track_response(conversation, question=True))
+
+        if self._is_vague_acknowledgement(user_input):
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_state("vague_ack", conversation, user_input)
+            return self._respond(conversation, self._build_off_track_response(conversation, question=False))
 
         rating_already_captured = self._get_context_value(conversation, "rating") is not None
         conversation.state = ConversationState.PRE_FEEDBACK_ANALYSIS
@@ -148,21 +167,14 @@ class ChatService:
                 return reply
 
         if previous_state == ConversationState.ISSUE_HANDLING:
-            conversation.state = ConversationState.ISSUE_HANDLING
-            reply = self._build_issue_follow_up(
-                self._get_context_value(conversation, "active_issue_type", "none"),
-                self._get_context_value(conversation, "last_issue_tags", []),
-                detailed=True,
-            )
-            self._log_state("issue_follow_up", conversation, user_input)
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            reply = self._build_off_track_response(conversation, question=False)
+            self._log_state("off_track", conversation, user_input)
             return self._respond(conversation, reply)
 
         conversation.state = ConversationState.FEEDBACK_CONTINUE
         self._log_state("redirect", conversation, user_input)
-        return self._respond(
-            conversation,
-            "I want to keep this focused on your AI experience. If there is another issue, highlight, or idea, tell me and I will add it.",
-        )
+        return self._respond(conversation, self._build_off_track_response(conversation, question=False))
 
     def _handle_feedback_turn(
         self,
@@ -173,6 +185,8 @@ class ChatService:
     ) -> str:
         extracted = self.llm_service.extract_feedback(user_input)
         issue = self.llm_service.classify_issue(user_input)
+        positive_only = self._is_positive_only_feedback(extracted)
+        issue_type_for_storage = "none" if positive_only else issue.issue_type
         rating_already_captured = self._get_context_value(conversation, "rating") is not None
 
         if not rating_already_captured:
@@ -187,13 +201,37 @@ class ChatService:
                 user_input=user_input,
                 extracted=extracted,
                 sentiment=extracted.sentiment,
-                issue_type=issue.issue_type,
+                issue_type=issue_type_for_storage,
             )
 
-        self._set_context_value(conversation, "active_issue_type", issue.issue_type)
+        self._set_context_value(conversation, "active_issue_type", issue_type_for_storage)
         self._set_context_value(conversation, "last_issue_tags", extracted.issue_tags)
         self._set_context_value(conversation, "last_sentiment", extracted.sentiment)
+
+        if positive_only:
+            self._reset_off_track_count(conversation)
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            return self._respond(conversation, self._build_positive_feedback_response(conversation, extracted))
+
         self._update_grounding_memory(conversation, user_input, extracted)
+        self._reset_off_track_count(conversation)
+
+        issue_summary = self._build_contextual_issue_summary(
+            conversation=conversation,
+            user_input=user_input,
+            extracted=extracted,
+            issue_type=issue_type_for_storage,
+        )
+        if issue_summary and self._should_complete_capture_after_summary(extracted, issue_type_for_storage):
+            if self._get_context_value(conversation, "rating") is None:
+                conversation.state = ConversationState.ASK_RATING
+                self._set_context_value(conversation, "rating_prompt_asked", True)
+            else:
+                conversation.state = ConversationState.FEEDBACK_CONTINUE
+            return self._respond(
+                conversation,
+                self._build_captured_issue_response(conversation, issue_summary),
+            )
 
         completion_reply = self._maybe_complete_active_thread(
             conversation=conversation,
@@ -208,7 +246,7 @@ class ChatService:
         contextual_follow_up = self._maybe_build_contextual_follow_up(
             conversation=conversation,
             extracted=extracted,
-            issue_type=issue.issue_type,
+            issue_type=issue_type_for_storage,
             previous_state=previous_state,
         )
 
@@ -227,6 +265,9 @@ class ChatService:
             conversation.state = ConversationState.FEEDBACK_CONTINUE
             base_reply = self._build_continue_prompt(conversation, extracted)
 
+        if issue_summary:
+            base_reply = self._combine_issue_summary_with_reply(issue_summary, base_reply)
+
         if (
             conversation.state != ConversationState.ASK_RATING
             and "?" in base_reply
@@ -235,7 +276,7 @@ class ChatService:
                 question=base_reply,
                 extracted=extracted,
                 user_feedback=user_input,
-                issue_type=issue.issue_type,
+                issue_type=issue_type_for_storage,
             )
         ):
             base_reply = self._build_progressive_acknowledgement(conversation)
@@ -245,7 +286,7 @@ class ChatService:
             base_reply=base_reply,
             user_feedback=user_input,
             extracted=extracted,
-            issue_type=issue.issue_type,
+            issue_type=issue_type_for_storage,
         )
         return self._respond(conversation, reply)
 
@@ -274,6 +315,7 @@ class ChatService:
     def _update_feedback_ratings(self, conversation: Conversation, rating: int) -> None:
         feedback = self._get_or_create_feedback_entry(conversation)
         feedback.rating = rating
+        feedback.summary = self._build_feedback_summary(feedback)
 
     def _store_feedback_entry(
         self,
@@ -326,6 +368,8 @@ class ChatService:
                 "invalidated_threads": [],
                 "latest_correction": "",
                 "current_domain": "",
+                "lightweight_continuations_used": 0,
+                "off_track_count": 0,
             },
         )
 
@@ -394,6 +438,8 @@ class ChatService:
                 "invalidated_threads": [],
                 "latest_correction": "",
                 "current_domain": "",
+                "lightweight_continuations_used": 0,
+                "off_track_count": 0,
             },
         }
 
@@ -412,6 +458,8 @@ class ChatService:
         memory.setdefault("invalidated_threads", [])
         memory.setdefault("latest_correction", "")
         memory.setdefault("current_domain", "")
+        memory.setdefault("lightweight_continuations_used", 0)
+        memory.setdefault("off_track_count", 0)
 
         current_domain = self._detect_conversation_domain(user_input)
         if not current_domain:
@@ -876,6 +924,128 @@ class ChatService:
             "no more",
         }
 
+    def _is_off_topic_question(self, user_input: str) -> bool:
+        raw = user_input.strip().lower()
+        is_question = raw.endswith("?")
+        normalized = raw.strip("?.! ")
+        if not normalized:
+            return False
+        off_topic_patterns = {
+            "what is your name",
+            "whats your name",
+            "what's your name",
+            "who are you",
+            "how are you",
+            "are you an ai",
+            "are you ai",
+            "who made you",
+            "what can you do",
+        }
+        if normalized in off_topic_patterns:
+            return True
+        return is_question and not any(
+            token in normalized
+            for token in {
+                "rate",
+                "rating",
+                "feedback",
+                "image",
+                "output",
+                "result",
+                "improve",
+                "issue",
+                "problem",
+                "look",
+                "feel",
+            }
+        )
+
+    def _is_vague_acknowledgement(self, user_input: str) -> bool:
+        normalized = user_input.strip().lower().strip(".! ")
+        return normalized in {
+            "ok",
+            "okay",
+            "alright",
+            "fine",
+            "cool",
+            "hmm",
+            "hmmm",
+            "got it",
+            "i see",
+            "sure",
+        }
+
+    def _build_off_track_response(self, conversation: Conversation, *, question: bool) -> str:
+        count = self._increment_off_track_count(conversation)
+        if count >= 2:
+            conversation.state = ConversationState.END
+            return "Understood. I will pause this feedback for now. Let me know if you would like to add anything later."
+
+        if question:
+            return "My name is HeuriSense. I am here to help collect feedback about your AI experience."
+
+        if self._has_feedback_context(conversation):
+            return "Noted. If there is anything else you would like to improve or highlight about the output, feel free to mention it."
+        return "I can add feedback about the AI experience whenever you are ready."
+
+    def _increment_off_track_count(self, conversation: Conversation) -> int:
+        context = self._conversation_context(conversation)
+        memory = context.setdefault("feedback_memory", self._default_context()["feedback_memory"])
+        count = int(memory.get("off_track_count", 0)) + 1
+        memory["off_track_count"] = count
+        context["feedback_memory"] = memory
+        conversation.context = context
+        return count
+
+    def _reset_off_track_count(self, conversation: Conversation) -> None:
+        context = self._conversation_context(conversation)
+        memory = context.setdefault("feedback_memory", self._default_context()["feedback_memory"])
+        memory["off_track_count"] = 0
+        context["feedback_memory"] = memory
+        conversation.context = context
+
+    def _is_confirmation_signal(self, user_input: str) -> bool:
+        normalized = user_input.strip().lower()
+        cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in normalized)
+        tokens = [token for token in cleaned.split() if token]
+        if not tokens or len(tokens) > 5:
+            return False
+
+        confirmation_tokens = {
+            "yes",
+            "yeah",
+            "yep",
+            "correct",
+            "exactly",
+            "right",
+            "true",
+            "sure",
+            "ok",
+            "okay",
+            "thanks",
+            "thank",
+            "you",
+            "that",
+            "s",
+            "is",
+            "thats",
+        }
+        if not set(tokens).issubset(confirmation_tokens):
+            return False
+        return any(token in tokens for token in {"yes", "yeah", "yep", "correct", "exactly", "right", "true", "sure", "ok", "okay"})
+
+    def _has_feedback_context(self, conversation: Conversation) -> bool:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        return bool(
+            self._get_context_value(conversation, "feedback_captured", False)
+            or self._feedback_count(conversation) > 0
+            or memory.get("negatives")
+            or memory.get("suggestions")
+            or memory.get("issue_tags")
+            or memory.get("active_thread")
+            or memory.get("completed_threads")
+        )
+
     def _is_thread_saturated(
         self,
         active_thread: str,
@@ -954,11 +1124,17 @@ class ChatService:
         context["feedback_memory"] = memory
         conversation.context = context
 
+    def _mark_active_thread_completed_if_present(self, conversation: Conversation) -> None:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        active_thread = str(memory.get("active_thread") or "")
+        if active_thread:
+            self._mark_thread_completed(conversation, active_thread)
+
     def _build_thread_summary_response(self, active_thread: str) -> str:
         if "technical_product_realism:" in active_thread:
             return "Understood. This was a technical realism issue: sharpness, materials, reflections, and proportions mattered most."
         if "emotional_tone:" in active_thread:
-            return "That makes sense. Visually the scene had potential, but the emotional realism and immersion were missing."
+            return "That makes sense. The scene needed stronger tone consistency, warmth, and lived-in detail."
         if "style:" in active_thread:
             return "Got it. The main gap was that the visual style did not match what you had in mind."
         if "lighting:" in active_thread:
@@ -986,7 +1162,11 @@ class ChatService:
             old_list = []
         if not new_list:
             new_list = []
-        return list(set(old_list + new_list))
+        merged: list[str] = []
+        for item in old_list + new_list:
+            if item and item not in merged:
+                merged.append(item)
+        return merged
 
     def _merge_raw_text(self, existing_text: str | None, new_text: str) -> str:
         existing_parts = [part for part in (existing_text or "").split("\n---\n") if part.strip()]
@@ -998,15 +1178,84 @@ class ChatService:
         summary_parts: list[str] = []
         if feedback.rating is not None:
             summary_parts.append(f"Rating {feedback.rating}/5")
-        if feedback.sentiment:
-            summary_parts.append(f"Sentiment {feedback.sentiment}")
-        if feedback.negatives:
-            summary_parts.append(f"Key issue: {feedback.negatives[0]}")
-        elif feedback.suggestions:
-            summary_parts.append(f"Top request: {feedback.suggestions[0]}")
-        elif feedback.positives:
-            summary_parts.append(f"Highlight: {feedback.positives[0]}")
+
+        positive = self._summary_phrase(feedback.positives, fallback="")
+        issue_dimensions = self._summary_issue_dimensions(feedback.issue_tags, feedback.negatives, feedback.suggestions)
+        complaint = self._summary_phrase(feedback.negatives, fallback="")
+        request = self._summary_phrase(feedback.suggestions, fallback="")
+
+        if positive and issue_dimensions:
+            summary_parts.append(f"{positive.capitalize()}, but {issue_dimensions} weakened the result")
+        elif positive and complaint:
+            summary_parts.append(f"{positive.capitalize()}, but {complaint}")
+        elif issue_dimensions:
+            summary_parts.append(f"{issue_dimensions.capitalize()} weakened the result")
+        elif complaint:
+            summary_parts.append(f"Key issue: {complaint}")
+        elif request:
+            summary_parts.append(f"Top request: {request}")
+        elif positive:
+            summary_parts.append(f"Highlight: {positive}")
         return " | ".join(summary_parts)
+
+    def _summary_phrase(self, values: list, *, fallback: str) -> str:
+        for value in values or []:
+            text = " ".join(str(value).strip().split())
+            if text:
+                return text
+        return fallback
+
+    def _summary_issue_dimensions(self, issue_tags: list, negatives: list, suggestions: list) -> str:
+        labels = [self._humanize_issue_tag(tag) for tag in issue_tags or [] if tag]
+        labels = [label for label in labels if label]
+        if not labels:
+            combined = " ".join(str(item) for item in list(negatives or []) + list(suggestions or [])).lower()
+            inferred: list[str] = []
+            if "density" in combined or "empty" in combined:
+                inferred.append("environmental density")
+            if "motion" in combined or "static" in combined:
+                inferred.append("motion realism")
+            if "lighting" in combined or "falloff" in combined:
+                inferred.append("lighting consistency")
+            if "texture" in combined:
+                inferred.append("texture realism")
+            if "scale" in combined or "massive" in combined:
+                inferred.append("scale consistency")
+            labels = inferred
+        return self._format_summary_labels(labels[:3])
+
+    def _humanize_issue_tag(self, tag: str) -> str:
+        label_map = {
+            "environmental_density": "environmental density",
+            "environmental_realism": "environmental realism",
+            "motion_realism": "motion realism",
+            "lighting_consistency": "lighting consistency",
+            "texture_realism": "texture realism",
+            "scale_consistency": "scale consistency",
+            "atmospheric_depth": "atmospheric depth",
+            "material_realism": "material realism",
+            "reflection_realism": "reflection realism",
+            "interaction_realism": "interaction realism",
+            "composition_balance": "composition balance",
+            "perspective_consistency": "perspective consistency",
+            "anatomy_accuracy": "anatomy accuracy",
+            "cinematic_alignment": "cinematic alignment",
+            "prompt_alignment": "prompt alignment",
+            "detail_sharpness": "detail sharpness",
+            "environmental_believability": "environmental believability",
+        }
+        return label_map.get(str(tag), str(tag).replace("_", " "))
+
+    def _format_summary_labels(self, labels: list[str]) -> str:
+        cleaned: list[str] = []
+        for label in labels:
+            if label and label not in cleaned:
+                cleaned.append(label)
+        if len(cleaned) <= 1:
+            return cleaned[0] if cleaned else ""
+        if len(cleaned) == 2:
+            return " and ".join(cleaned)
+        return f"{cleaned[0]}, {cleaned[1]}, and {cleaned[2]}"
 
     def _get_feedback_entries(self, conversation: Conversation) -> list[Feedback]:
         return list(self.db.scalars(select(Feedback).where(Feedback.conversation_id == conversation.id).order_by(Feedback.id)))
@@ -1090,6 +1339,8 @@ class ChatService:
             "nah",
             "not now",
             "nothing else",
+            "nothing more",
+            "no other issues",
             "that's all",
             "thats all",
             "all good",
@@ -1098,6 +1349,9 @@ class ChatService:
             "stop",
             "that's it",
             "thats it",
+            "done",
+            "i'm done",
+            "i am done",
         }
 
     def _maybe_build_contextual_follow_up(
@@ -1152,7 +1406,7 @@ class ChatService:
             return "performance_detail"
         if extracted.suggestions:
             return "feature_request"
-        if issue_type in {"technical", "usability", "quality"} and extracted.negatives:
+        if issue_type in {"technical", "usability"} and extracted.negatives:
             return issue_type
         if extracted.sentiment == "positive" and extracted.positives:
             return "positive_detail"
@@ -1177,7 +1431,7 @@ class ChatService:
             "feature_request": "That is helpful. What would you expect the system to do differently in the ideal version?",
             "technical": "That sounds frustrating. What exactly happened, and what were you trying to do at the time?",
             "usability": "I can work with that. Which part felt hardest to use, and what would make it clearer?",
-            "quality": "I want to capture this accurately. What felt unrealistic, missing, or off about the output?",
+            "quality": "I have noted the quality concern.",
             "positive_detail": "That is good to hear. What specifically worked well for you?",
             "clarify": "Can you say a little more so I capture the useful part of that feedback?",
         }
@@ -1308,10 +1562,210 @@ class ChatService:
             return "Got it. The product needed sharper detail, stronger materials, cleaner reflections, and more realistic proportions."
         invalidated = " ".join(memory.get("invalidated_threads", []))
         if current_domain != "technical_product_realism" and "emotional_tone" not in invalidated and {"cinematic_atmosphere", "emotional_flatness"} & evidence:
-            return "Understood. The realism problem seems less technical and more emotional and atmospheric."
+            return "Understood. The realism problem seems more about tone, warmth, and lived-in scene detail."
         if {"natural_human_feeling", "artificial_posing"} & evidence:
-            return "Got it. The scene needed to feel more naturally lived-in and emotionally believable."
+            return "Got it. The scene needed more natural posing and lived-in interaction detail."
         return "I think I understand the gap clearly now. This feedback is helpful."
+
+    def _should_complete_capture_after_summary(self, extracted: FeedbackExtraction, issue_type: str) -> bool:
+        if not self._has_extractable_feedback(extracted):
+            return False
+        if extracted.sentiment == "positive" and not extracted.negatives and not extracted.suggestions:
+            return False
+        return issue_type in {"quality", "technical", "usability", "none"}
+
+    def _is_positive_only_feedback(self, extracted: FeedbackExtraction) -> bool:
+        return bool(extracted.positives) and not extracted.negatives and not extracted.suggestions
+
+    def _build_positive_feedback_response(self, conversation: Conversation, extracted: FeedbackExtraction) -> str:
+        positive_focus = self._positive_focus_phrase(extracted.positives)
+        acknowledgement = (
+            f"Glad to hear that - I have noted {positive_focus} positively."
+            if positive_focus
+            else "Glad to hear that - I have noted the positive feedback."
+        )
+
+        if self._get_context_value(conversation, "rating") is None and not self._get_context_value(conversation, "rating_prompt_asked", False):
+            return acknowledgement
+
+        continuation = self._maybe_lightweight_continuation(conversation)
+        if continuation:
+            return f"{acknowledgement} {continuation}"
+        return acknowledgement
+
+    def _positive_focus_phrase(self, positives: list[str]) -> str:
+        combined = " ".join(positives or []).lower()
+        focus: list[str] = []
+        if any(token in combined for token in {"water", "underwater", "ocean"}):
+            focus.append("the underwater atmosphere")
+        if any(token in combined for token in {"color", "colors", "palette", "blue"}):
+            focus.append("the color palette")
+        if any(token in combined for token in {"whale", "character", "design"}):
+            focus.append("the whale design")
+        if any(token in combined for token in {"lighting", "light", "mood"}):
+            focus.append("the lighting mood")
+        if any(token in combined for token in {"composition", "framing"}):
+            focus.append("the composition")
+        if any(token in combined for token in {"atmosphere", "mood", "style", "cinematic"}):
+            focus.append("the atmosphere")
+
+        if focus:
+            return self._format_summary_labels(focus[:2])
+        if positives:
+            return positives[0]
+        return ""
+
+    def _build_captured_issue_response(self, conversation: Conversation, issue_summary: str) -> str:
+        if self._get_context_value(conversation, "rating") is None:
+            return f"{issue_summary}\n\n{self._build_rating_prompt()}"
+
+        acknowledgement = "I have noted this feedback down."
+        continuation = self._maybe_lightweight_continuation(conversation)
+        if continuation:
+            return f"{issue_summary} {acknowledgement} {continuation}"
+        return f"{issue_summary} {acknowledgement}"
+
+    def _build_confirmation_continue_response(self, conversation: Conversation) -> str:
+        continuation = self._maybe_lightweight_continuation(conversation, force=True)
+        if continuation:
+            return f"Great. I have noted this feedback down. {continuation}"
+        return "Great. I have noted this feedback down."
+
+    def _maybe_lightweight_continuation(self, conversation: Conversation, *, force: bool = False) -> str:
+        context = self._conversation_context(conversation)
+        memory = context.setdefault("feedback_memory", self._default_context()["feedback_memory"])
+        used = int(memory.get("lightweight_continuations_used", 0))
+        count = self._feedback_count(conversation)
+
+        if not force and used > 0 and count % 3 != 1:
+            return ""
+
+        variants = [
+            "Anything else you would like to add?",
+            "Is there anything else that needs improvement?",
+            "Would you like to add any other feedback?",
+        ]
+        prompt = variants[used % len(variants)]
+        memory["lightweight_continuations_used"] = used + 1
+        context["feedback_memory"] = memory
+        conversation.context = context
+        return prompt
+
+    def _build_contextual_issue_summary(
+        self,
+        *,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+        issue_type: str,
+    ) -> str:
+        if extracted.sentiment == "positive" and not extracted.negatives and not extracted.suggestions:
+            return ""
+
+        dimensions = self._infer_issue_dimensions(conversation, user_input, extracted, issue_type)
+        if not dimensions:
+            return ""
+
+        phrase = self._format_issue_dimensions(dimensions)
+
+        realism_dimensions = {
+            "scale",
+            "environmental",
+            "material",
+            "texture",
+            "motion",
+            "body",
+            "lighting",
+            "posing",
+            "sharpness",
+            "finish",
+        }
+        if any(token in phrase for token in realism_dimensions) or issue_type == "quality":
+            return f"I see - the realism mainly breaks in {phrase}."
+        if issue_type == "technical":
+            return f"I see - the main problem is {phrase}."
+        return f"I see - the feedback points mostly to {phrase}."
+
+    def _format_issue_dimensions(self, dimensions: list[str]) -> str:
+        selected = dimensions[:3]
+        if len(selected) <= 1:
+            return selected[0] if selected else ""
+        if len(selected) == 2:
+            return " and ".join(selected)
+        return f"{selected[0]}, {selected[1]}, and {selected[2]}"
+
+    def _infer_issue_dimensions(
+        self,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+        issue_type: str,
+    ) -> list[str]:
+        normalized = " ".join(
+            [user_input, *extracted.negatives, *extracted.suggestions, *extracted.issue_tags]
+        ).lower()
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        evidence = set(memory.get("thread_evidence", [])) | set(self._extract_issue_terms(user_input, extracted))
+
+        dimensions: list[str] = []
+
+        def add(dimension: str) -> None:
+            if any(dimension in existing or existing in dimension for existing in dimensions):
+                return
+            if dimension not in dimensions:
+                dimensions.append(dimension)
+
+        if any(token in normalized for token in {"scale", "massive", "huge", "size", "proportion", "proportions"}):
+            add("scale consistency")
+        if any(token in normalized for token in {"depth", "depth cues", "underwater depth", "underwater"}):
+            add("underwater depth cues")
+        if any(token in normalized for token in {"falloff", "fall off", "lighting falloff", "light falloff"}):
+            add("lighting falloff")
+        elif any(token in normalized for token in {"lighting", "artificial light", "shadow", "shadows", "mood"}):
+            add("lighting consistency")
+        if any(token in normalized for token in {"integrated", "integration", "naturally integrated"}):
+            add("environmental integration")
+        elif any(token in normalized for token in {"environment", "scene", "water", "ocean"}):
+            add("environmental realism")
+        if any(token in normalized for token in {"syrup", "butter", "melt", "melting", "pour", "flow", "fluid", "liquid", "behave"}):
+            add("material behavior")
+        if any(token in normalized for token in {"texture", "textures", "material", "materials", "surface", "syrup", "butter"}):
+            add("texture consistency")
+        if any(token in normalized for token in {"frozen", "stiff", "static", "motion", "action", "movement"}):
+            add("motion and body dynamics")
+        if any(token in normalized for token in {"player", "athlete", "pose", "body"}):
+            add("body dynamics")
+        if any(token in normalized for token in {"flat", "cold", "emotion", "emotional", "vibe", "atmosphere", "warm", "cozy"}):
+            add("tone consistency")
+        if any(token in normalized for token in {"style", "cartoon", "anime", "cinematic"}):
+            add("style alignment")
+        if any(token in normalized for token in {"blurry", "sharpness", "sharp", "detail", "details"}):
+            add("detail sharpness")
+        if any(token in normalized for token in {"reflection", "reflections", "metal", "metallic"}):
+            add("material finish")
+
+        if {"environmental_scale", "aerial_perspective", "water_texture_realism", "island_realism"} & evidence:
+            add("environmental believability")
+        if {"image_sharpness", "missing_reflections", "material_quality", "distorted_proportions"} & evidence:
+            add("technical realism")
+        if {"cinematic_atmosphere", "emotional_flatness"} & evidence:
+            add("tone consistency")
+        if {"artificial_posing", "natural_human_feeling"} & evidence:
+            add("natural posing")
+
+        if not dimensions and issue_type == "quality":
+            add("output quality")
+        elif not dimensions and issue_type == "usability":
+            add("usability clarity")
+
+        return dimensions[:4]
+
+    def _combine_issue_summary_with_reply(self, issue_summary: str, base_reply: str) -> str:
+        if not issue_summary or issue_summary.lower() in base_reply.lower():
+            return base_reply
+        if base_reply.startswith(("I see -", "Got it.", "Understood.", "That makes sense.")):
+            return base_reply
+        return f"{issue_summary}\n\n{base_reply}"
 
     def _build_issue_follow_up(self, issue_type: str, issue_tags: list[str], detailed: bool) -> str:
         if "slow_response_time" in issue_tags:
@@ -1334,7 +1788,7 @@ class ChatService:
 
     def _build_rating_prompt(self) -> str:
         return (
-            "On a scale of 1-5, how would you rate your experience?\n"
+            "On a scale of 1-5, how would you rate your experience?\n\n"
             "1 = Very poor (unusable, major issues)\n"
             "2 = Poor (many problems)\n"
             "3 = Average (some issues)\n"
@@ -1365,11 +1819,80 @@ class ChatService:
         return variants[count % len(variants)]
 
     def _build_post_rating_response(self, conversation: Conversation, rating: int) -> str:
-        if rating <= 2:
-            return "Thanks for being direct. If there is one more problem you want prioritized, tell me and I will add it."
-        if rating == 3:
-            return "Thanks, I have added the rating. If there is another improvement that would move this from average to good, I would like to capture it."
-        return "Thanks, I have added the rating. If there is anything else worth preserving or improving, tell me."
+        follow_up = self._build_context_aware_rating_follow_up(conversation, rating)
+        if follow_up:
+            return f"Thanks, I have added the rating. {follow_up}"
+        return "Thanks, I have added the rating. I have captured the key feedback areas. Is there anything else you would like to add?"
+
+    def _build_context_aware_rating_follow_up(self, conversation: Conversation, rating: int) -> str:
+        covered = self._captured_feedback_dimensions(conversation)
+        if self._has_enough_feedback_after_rating(conversation, covered, rating):
+            return ""
+
+        missing_options = self._missing_rating_follow_up_options(covered)
+        if len(missing_options) >= 2:
+            return (
+                "What aspect would improve the experience most now - "
+                f"{', '.join(missing_options[:2])}, or something else?"
+            )
+
+        if rating <= 3:
+            return "What part of the result still feels furthest from your expectation?"
+
+        return "If one thing could improve the score most, what would it be?"
+
+    def _has_enough_feedback_after_rating(self, conversation: Conversation, covered: set[str], rating: int) -> bool:
+        count = self._feedback_count(conversation)
+        if rating >= 4 and count > 0:
+            return True
+        return count >= 2 or len(covered) >= 4
+
+    def _missing_rating_follow_up_options(self, covered: set[str]) -> list[str]:
+        priority = [
+            ("realism", {"scale", "environment", "lighting", "texture", "motion", "anatomy", "integration"}),
+            ("scene density", {"scene_density", "composition"}),
+            ("motion", {"motion"}),
+            ("prompt accuracy", {"prompt_alignment", "accuracy"}),
+            ("surface detail", {"texture", "material", "detail"}),
+            ("composition", {"composition"}),
+        ]
+        options: list[str] = []
+        for label, overlaps in priority:
+            if not overlaps & covered and label not in options:
+                options.append(label)
+        return options[:3]
+
+    def _captured_feedback_dimensions(self, conversation: Conversation) -> set[str]:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        combined = " ".join(
+            [
+                " ".join(memory.get("negatives", [])),
+                " ".join(memory.get("suggestions", [])),
+                " ".join(memory.get("issue_tags", [])),
+                " ".join(memory.get("thread_evidence", [])),
+                " ".join(memory.get("contextual_mismatches", [])),
+            ]
+        ).lower()
+
+        dimensions: set[str] = set()
+
+        def add_if(tokens: set[str], dimension: str) -> None:
+            if any(token in combined for token in tokens):
+                dimensions.add(dimension)
+
+        add_if({"light", "lighting", "shadow", "falloff", "mood"}, "lighting")
+        add_if({"scale", "massive", "size", "proportion", "environmental_scale"}, "scale")
+        add_if({"environment", "integrated", "integration", "water", "ocean", "underwater", "scene"}, "environment")
+        add_if({"texture", "surface", "material", "water_texture", "materials"}, "texture")
+        add_if({"motion", "movement", "static", "frozen", "body dynamics"}, "motion")
+        add_if({"anatomy", "body", "pose", "posing", "proportions"}, "anatomy")
+        add_if({"composition", "framing", "perspective", "aerial"}, "composition")
+        add_if({"accuracy", "incorrect", "wrong", "missed prompt", "prompt"}, "prompt_alignment")
+        add_if({"detail", "sharpness", "sharp", "blurry"}, "detail")
+        add_if({"density", "empty", "sparse"}, "scene_density")
+        add_if({"reflection", "metal", "finish"}, "material")
+        add_if({"interaction", "interact", "lived-in", "natural"}, "integration")
+        return dimensions
 
     def _build_post_rating_prompt(self, rating: int) -> str:
         if rating <= 2:

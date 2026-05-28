@@ -13,8 +13,9 @@ Required output format:
 Rules:
 - Mark intent as "feedback" when the user gives any opinion, complaint, suggestion, praise, or problem report.
 - Mark intent as "rating" only when the message is mainly a score such as "3", "I'd rate it 4", or "2/5".
-- Mark intent as "off_topic" when it does not contribute feedback or rating.
+- Mark intent as "off_topic" when it does not contribute feedback or rating, including casual questions like "what is your name?" or "how are you?"
 - If the message contains both feedback and rating, prefer intent="feedback".
+- Pure praise is feedback with positive sentiment and issue_type="none" unless it also includes a problem or requested improvement.
 - Treat emotional mismatch, missing vibe, warmth, mood, tone, realism, or atmosphere as feedback.
 - Choose issue_type="technical" for crashes, freezing, delays, failed actions, or broken behavior.
 - Choose issue_type="usability" for confusing flows, difficult UI, unclear steps, navigation problems, or hard-to-use interactions.
@@ -78,15 +79,23 @@ Extraction rules:
 - Capture multiple insights from one message.
 - Ignore noise or irrelevant filler.
 - Use short concrete phrases grounded in the user's wording.
+- Split mixed statements carefully. Text before "but/however/though" may be positive while text after it may be negative.
+- positives: only things the user explicitly liked, praised, or said worked.
+- negatives: concrete failures, missing qualities, realism gaps, or weak areas.
+- suggestions: explicit or implied requested improvements such as "more moving crowds", "better reflections", or "stronger lighting falloff".
+- Never put missing/needed improvements in positives.
 - Treat "wanted", "missed the vibe", "not warm/cozy", "felt flat", and similar emotional/tone gaps as negatives or suggestions even when phrased softly.
-- issue_tags must be snake_case, specific, reusable, 2 to 4 words when possible, and non-duplicated.
+- issue_tags must be 3 to 5 snake_case tags, specific, reusable, and non-duplicated.
 - issue_tags should describe root issues or requested changes, not emotions.
 - Tags must align with negatives and suggestions.
+- Prefer concrete tags such as environmental_density, environmental_realism, lighting_consistency, motion_realism, texture_realism, scale_consistency, atmospheric_depth, material_realism, reflection_realism, interaction_realism, composition_balance, perspective_consistency, anatomy_accuracy, cinematic_alignment, prompt_alignment, detail_sharpness.
+- Avoid vague tags such as realism_issue, visual_quality, quality_problem, lack_of_realism, technical_product_realism, environmental_aerial_realism.
 
 Examples:
 - "navigation is hard" -> negatives=["navigation is hard"], issue_tags=["navigation_difficulty"]
 - "it took 7 minutes" -> negatives=["it took 7 minutes"], issue_tags=["slow_image_generation"]
-- "puppies were not realistic" -> negatives=["puppies were not realistic"], issue_tags=["lack_of_realism"]
+- "The visual style looked strong, but the city felt empty and lacked motion, density, and realism." -> positives=["visual style looked strong"], negatives=["city felt empty", "lacked motion, density, and realism"], suggestions=["more motion and environmental density"], issue_tags=["environmental_density", "environmental_realism", "motion_realism", "cinematic_alignment"]
+- "puppies were not realistic" -> negatives=["puppies were not realistic"], issue_tags=["environmental_realism"]
 - "generate 2 images" -> suggestions=["generate 2 images"], issue_tags=["multiple_output_request"]
 
 Feedback text: {message}
@@ -111,10 +120,13 @@ Return strict JSON only:
 
 Rules:
 - Use snake_case
-- Make tags specific but reusable
+- Return 3 to 5 tags when enough signal exists.
+- Make tags specific but reusable.
 - Avoid duplicates
 - Focus on root issue or requested behavior
-- 2 to 4 words when possible
+- Prefer concrete issue dimensions over broad labels.
+- Good tags include environmental_density, environmental_realism, lighting_consistency, motion_realism, texture_realism, scale_consistency, atmospheric_depth, material_realism, reflection_realism, interaction_realism, composition_balance, perspective_consistency, anatomy_accuracy, cinematic_alignment, prompt_alignment, detail_sharpness.
+- Avoid vague tags such as realism_issue, visual_quality, quality_problem, lack_of_realism, technical_product_realism, environmental_aerial_realism.
 
 Feedback text: {message}
 """
@@ -149,6 +161,7 @@ Rules:
 - If grounding_context includes current_domain, keep the response inside that domain.
 - Do not reuse anything listed in do_not_reuse_invalidated_threads.
 - Prefer confirming a specific mismatch over generic questions like "what felt off?"
+- Never ask generic collection prompts like "what felt off?", "tell me more", or "what looked unrealistic?"
 - Do not ask usability/confusion questions unless the user actually mentioned confusion, navigation, or steps.
 - Do not ask another question just to reconfirm something already clear from context.
 - Ask for one useful missing detail, not multiple questions.

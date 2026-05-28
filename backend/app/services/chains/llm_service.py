@@ -72,6 +72,12 @@ class FallbackClassifier:
         "useful",
         "like",
         "nice",
+        "beautiful",
+        "strong",
+        "worked",
+        "appealing",
+        "professional",
+        "cinematic",
     }
     NEGATIVE_HINTS = {
         "bad",
@@ -114,6 +120,17 @@ class FallbackClassifier:
         "hard",
         "unrealistic",
         "delay",
+        "empty",
+        "lacked",
+        "lacks",
+        "density",
+        "static",
+        "artificial",
+        "fake",
+        "staged",
+        "unnatural",
+        "weak",
+        "hollow",
     }
     VAGUE_RATING_HINTS = {"okay", "ok", "fine", "average", "decent", "not bad", "so so", "its okay", "it's okay"}
     STOP_HINTS = {"no", "no more", "stop", "that's it", "thats it", "nothing else", "no thanks"}
@@ -160,6 +177,16 @@ class FallbackClassifier:
         "proportions",
         "product quality",
         "luxury product",
+        "realism",
+        "empty",
+        "lacked",
+        "lacks",
+        "density",
+        "static",
+        "artificial",
+        "fake",
+        "staged",
+        "unnatural",
     }
     USABILITY_HINTS = {"hard", "confusing", "confused", "ui", "ux", "difficult", "unclear", "find", "navigation", "use"}
 
@@ -242,37 +269,94 @@ class FallbackClassifier:
 
     @classmethod
     def extract_feedback(cls, message: str) -> FeedbackExtraction:
-        lower = message.lower()
-        parts = [part.strip() for part in message.replace("\n", ". ").split(".") if part.strip()]
-        positives = [part for part in parts if any(word in part.lower() for word in cls.POSITIVE_HINTS)]
-        negatives = [part for part in parts if any(word in part.lower() for word in cls.NEGATIVE_HINTS)]
-        suggestions = [
-            part
-            for part in parts
-            if any(token in part.lower() for token in {"should", "could", "improve", "better", "easier", "add", "make"})
-        ]
+        clauses = cls._feedback_clauses(message)
+        positives: list[str] = []
+        negatives: list[str] = []
+        suggestions: list[str] = []
 
-        if "realistic" in lower and any(token in lower for token in {"more realistic", "not realistic", "unrealistic"}):
-            tag_hint = "lack_of_realism"
-        elif any(token in lower for token in {"missed the vibe", "not emotionally warm", "not warm", "not cozy", "felt flat"}):
-            tag_hint = "emotional_tone_mismatch"
-        else:
-            tag_hint = None
+        for clause in clauses:
+            normalized = clause.lower()
+            cleaned = cls._clean_feedback_phrase(clause)
+            if not cleaned:
+                continue
 
-        issue_tags = cls.generate_issue_tags(message)
-        if tag_hint and tag_hint not in issue_tags:
-            issue_tags.insert(0, tag_hint)
+            is_suggestion = cls._has_suggestion_signal(normalized)
+            is_negative = cls._has_negative_signal(normalized)
+            is_positive = cls._has_positive_signal(normalized)
 
-        if not positives and not negatives and not suggestions and parts and len(parts[0].split()) >= 3:
-            negatives = [parts[0]]
+            if is_suggestion:
+                suggestions.append(cleaned)
+            if is_negative or (is_suggestion and any(token in normalized for token in {"missing", "lacked", "lacks", "needed", "needs"})):
+                negatives.append(cleaned)
+            elif is_positive:
+                positives.append(cleaned)
 
-        sentiment = cls.analyze_sentiment(message).sentiment
+        if (
+            not positives
+            and not negatives
+            and not suggestions
+            and clauses
+            and len(clauses[0].split()) >= 3
+            and cls._has_feedback_signal(message)
+        ):
+            negatives = [cls._clean_feedback_phrase(clauses[0])]
+
+        return cls.refine_feedback(
+            message,
+            FeedbackExtraction(
+                sentiment=cls.analyze_sentiment(message).sentiment,
+                positives=positives[:5],
+                negatives=negatives[:5],
+                suggestions=suggestions[:5],
+                issue_tags=cls.generate_issue_tags(message),
+            ),
+        )
+
+    @classmethod
+    def refine_feedback(cls, message: str, extraction: FeedbackExtraction) -> FeedbackExtraction:
+        positives: list[str] = []
+        negatives: list[str] = []
+        suggestions: list[str] = []
+
+        for item in extraction.positives:
+            cleaned = cls._clean_feedback_phrase(item)
+            lowered = cleaned.lower()
+            if not cleaned:
+                continue
+            if cls._has_negative_signal(lowered) or cls._has_suggestion_signal(lowered):
+                if cls._has_suggestion_signal(lowered):
+                    suggestions.append(cleaned)
+                negatives.append(cleaned)
+            else:
+                positives.append(cleaned)
+
+        for item in extraction.negatives:
+            cleaned = cls._clean_feedback_phrase(item)
+            if cleaned:
+                negatives.append(cleaned)
+
+        for item in extraction.suggestions:
+            cleaned = cls._clean_feedback_phrase(item)
+            if cleaned:
+                suggestions.append(cleaned)
+
+        inferred = cls._infer_structured_items(message)
+        positives = cls._dedupe_preserve([*positives, *inferred["positives"]])[:5]
+        negatives = cls._dedupe_preserve([*negatives, *inferred["negatives"]])[:6]
+        suggestions = cls._dedupe_preserve([*suggestions, *inferred["suggestions"]])[:5]
+        issue_tags = (
+            cls._best_issue_tags(message, positives, negatives, suggestions, extraction.issue_tags)
+            if negatives or suggestions
+            else []
+        )
+        sentiment = cls._structured_sentiment(positives, negatives, suggestions)
+
         return FeedbackExtraction(
             sentiment=sentiment,
-            positives=positives[:5],
-            negatives=negatives[:5],
-            suggestions=suggestions[:5],
-            issue_tags=issue_tags[:8],
+            positives=positives,
+            negatives=negatives,
+            suggestions=suggestions,
+            issue_tags=issue_tags,
         )
 
     @classmethod
@@ -288,41 +372,244 @@ class FallbackClassifier:
 
     @classmethod
     def generate_issue_tags(cls, message: str) -> list[str]:
-        normalized = message.lower()
+        return cls._best_issue_tags(message, [], [], [], [])
+
+    @classmethod
+    def _best_issue_tags(
+        cls,
+        message: str,
+        positives: list[str],
+        negatives: list[str],
+        suggestions: list[str],
+        existing_tags: list[str],
+    ) -> list[str]:
+        normalized = " ".join([message, *negatives, *suggestions]).lower()
         tags: list[str] = []
 
         def add(tag: str) -> None:
             if tag not in tags:
                 tags.append(tag)
 
+        blocked_generic = {
+            "lack_of_realism",
+            "realism_issue",
+            "visual_quality",
+            "quality_problem",
+            "technical_product_realism",
+            "environmental_aerial_realism",
+            "emotional_tone_mismatch",
+            "cinematic_atmosphere_request",
+            "visual_style_feedback",
+        }
+        for tag in existing_tags:
+            if tag and tag not in blocked_generic:
+                add(tag)
+
         if any(token in normalized for token in {"navigation", "hard to find", "difficult to find"}):
             add("navigation_difficulty")
         if any(token in normalized for token in {"slow", "minutes", "delay", "took"}):
             add("slow_response_time")
-        if any(token in normalized for token in {"realistic", "unrealistic"}):
-            add("lack_of_realism")
-        if any(token in normalized for token in {"add more", "nature elements", "more nature"}):
-            add("nature_element_request")
         if any(token in normalized for token in {"generate 2 images", "two images", "multiple images"}):
             add("multiple_output_request")
         if any(token in normalized for token in {"crash", "error", "freeze", "broken"}):
             add("runtime_failure")
         if any(token in normalized for token in {"incorrect", "inaccurate", "wrong"}):
-            add("accuracy_problem")
-        if any(token in normalized for token in {"color theme", "colour scheme", "color scheme"}):
-            add("visual_style_feedback")
-        if any(token in normalized for token in {"sober", "tone down", "less flashy"}):
-            add("visual_tone_adjustment")
-        if any(token in normalized for token in {"missed the vibe", "not emotionally warm", "not warm", "not cozy", "felt flat"}):
-            add("emotional_tone_mismatch")
-        if any(token in normalized for token in {"cinematic and alive", "real cafe", "movie"}):
-            add("cinematic_atmosphere_request")
-        if any(token in normalized for token in {"sharpness", "blurry", "material", "materials", "reflections", "proportions", "product quality"}):
-            add("technical_product_realism")
-        if any(token in normalized for token in {"tropical island", "aerial", "drone", "environmental scale", "water texture", "water textures", "perspective"}):
-            add("environmental_aerial_realism")
+            add("prompt_alignment")
+        if any(token in normalized for token in {"empty", "density", "crowd", "crowds", "busy", "alive", "activity", "drones", "traffic"}):
+            add("environmental_density")
+        if any(token in normalized for token in {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable", "realism", "realistic", "unrealistic"}):
+            add("environmental_realism")
+        if any(token in normalized for token in {"motion", "movement", "moving", "static", "frozen", "action"}):
+            add("motion_realism")
+        if any(token in normalized for token in {"lighting", "light", "shadow", "falloff", "glow", "neon"}):
+            add("lighting_consistency")
+        if any(token in normalized for token in {"texture", "surface", "grain", "artificial texture"}):
+            add("texture_realism")
+        if any(token in normalized for token in {"material", "metal", "metallic", "fabric", "skin", "plastic"}):
+            add("material_realism")
+        if any(token in normalized for token in {"reflection", "reflections", "reflective", "mirror"}):
+            add("reflection_realism")
+        if any(token in normalized for token in {"scale", "massive", "size", "proportion", "proportions"}):
+            add("scale_consistency")
+        if any(token in normalized for token in {"depth", "depth cues", "atmospheric", "haze", "distance", "falloff"}):
+            add("atmospheric_depth")
+        if any(token in normalized for token in {"interaction", "integrated", "integration", "natural behavior", "unnatural"}):
+            add("interaction_realism")
+        if any(token in normalized for token in {"composition", "framing", "balance", "layout"}):
+            add("composition_balance")
+        if any(token in normalized for token in {"perspective", "aerial", "angle", "vanishing"}):
+            add("perspective_consistency")
+        if any(token in normalized for token in {"anatomy", "body", "limb", "face", "hand", "pose"}):
+            add("anatomy_accuracy")
+        if any(token in normalized for token in {"cinematic", "film", "mood", "atmosphere", "cyberpunk", "neon", "visual style", "style looked strong"}):
+            add("cinematic_alignment")
+        if any(token in normalized for token in {"sharp", "sharpness", "blurry", "detail", "details"}):
+            add("detail_sharpness")
 
-        return tags[:8]
+        if not tags and any(token in normalized for token in {"realism", "realistic", "unrealistic"}):
+            add("environmental_believability")
+
+        return tags[:5]
+
+    @classmethod
+    def _feedback_clauses(cls, message: str) -> list[str]:
+        text = message.replace("\n", ". ")
+        for marker in [" but ", " however ", " though ", " although ", " while "]:
+            text = text.replace(marker, ". ")
+        return [part.strip(" ,.;:-") for part in text.split(".") if part.strip(" ,.;:-")]
+
+    @classmethod
+    def _has_positive_signal(cls, text: str) -> bool:
+        return any(word in text for word in cls.POSITIVE_HINTS) or any(
+            phrase in text
+            for phrase in {
+                "worked well",
+                "looked strong",
+                "looked beautiful",
+                "was appealing",
+                "felt professional",
+            }
+        )
+
+    @classmethod
+    def _has_negative_signal(cls, text: str) -> bool:
+        return text.startswith("not ") or " not " in text or any(word in text for word in cls.NEGATIVE_HINTS) or any(
+            phrase in text
+            for phrase in {
+                "did not feel",
+                "didn't feel",
+                "does not feel",
+                "felt off",
+                "felt empty",
+                "felt static",
+                "not integrated",
+                "not massive",
+            }
+        )
+
+    @staticmethod
+    def _has_suggestion_signal(text: str) -> bool:
+        return any(
+            token in text
+            for token in {
+                "should",
+                "could",
+                "improve",
+                "better",
+                "add",
+                "make",
+                "more ",
+                "stronger",
+                "improved",
+                "needed",
+                "needs",
+                "moving crowds",
+                "active drones",
+                "city activity",
+                "environmental density",
+            }
+        )
+
+    @classmethod
+    def _has_feedback_signal(cls, text: str) -> bool:
+        normalized = text.lower()
+        return (
+            cls._has_positive_signal(normalized)
+            or cls._has_negative_signal(normalized)
+            or cls._has_suggestion_signal(normalized)
+            or any(
+                token in normalized
+                for token in {
+                    "image",
+                    "output",
+                    "result",
+                    "scene",
+                    "looked",
+                    "felt",
+                    "experience",
+                    "feedback",
+                }
+            )
+        )
+
+    @staticmethod
+    def _clean_feedback_phrase(text: str) -> str:
+        cleaned = " ".join(text.strip(" ,.;:-").split())
+        for prefix in ("but ", "and ", "also ", "the "):
+            if cleaned.lower().startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip()
+        return cleaned
+
+    @classmethod
+    def _infer_structured_items(cls, message: str) -> dict[str, list[str]]:
+        normalized = message.lower()
+        positives: list[str] = []
+        negatives: list[str] = []
+        suggestions: list[str] = []
+
+        if any(token in normalized for token in {"visual style looked strong", "style looked strong", "strong visual style"}):
+            positives.append("strong visual style")
+        if any(token in normalized for token in {"neon", "cyberpunk"}) and any(token in normalized for token in {"strong", "worked", "beautiful", "appealing"}):
+            positives.append("neon atmosphere worked well")
+        if "composition" in normalized and any(token in normalized for token in {"beautiful", "worked", "cinematic", "professional"}):
+            positives.append("composition worked well")
+        if any(token in normalized for token in {"colors looked beautiful", "color palette", "underwater colors"}):
+            positives.append("color palette worked well")
+
+        if "empty" in normalized:
+            negatives.append("scene felt empty")
+        if "density" in normalized or "crowd" in normalized or "crowds" in normalized:
+            negatives.append("lacked environmental density")
+        if any(token in normalized for token in {"motion", "movement", "moving crowds", "active drones", "static"}):
+            negatives.append("motion felt static")
+        if any(token in normalized for token in {"realism", "realistic", "unrealistic"}):
+            negatives.append("realism weakened")
+        if "texture" in normalized:
+            negatives.append("textures looked artificial")
+        if "scale" in normalized or "massive" in normalized:
+            negatives.append("scale felt unrealistic")
+        if "falloff" in normalized:
+            negatives.append("lighting lacked falloff")
+        if "reflection" in normalized:
+            negatives.append("reflections felt fake")
+        if "integrated" in normalized or "integration" in normalized:
+            negatives.append("environmental integration felt unnatural")
+
+        if any(token in normalized for token in {"moving crowds", "active drones", "more crowds", "more activity"}):
+            suggestions.append("more visible city activity")
+        if "motion" in normalized and "density" in normalized:
+            suggestions.append("more motion and environmental density")
+        if "density" in normalized:
+            suggestions.append("better environmental density")
+        if "falloff" in normalized:
+            suggestions.append("stronger lighting falloff")
+        if "reflection" in normalized:
+            suggestions.append("improved reflections")
+        if "texture" in normalized:
+            suggestions.append("better texture realism")
+        if "depth" in normalized:
+            suggestions.append("stronger depth cues")
+
+        return {"positives": positives, "negatives": negatives, "suggestions": suggestions}
+
+    @staticmethod
+    def _dedupe_preserve(items: list[str]) -> list[str]:
+        deduped: list[str] = []
+        for item in items:
+            cleaned = " ".join(str(item).strip().split())
+            if cleaned and cleaned.lower() not in {existing.lower() for existing in deduped}:
+                deduped.append(cleaned)
+        return deduped
+
+    @staticmethod
+    def _structured_sentiment(positives: list[str], negatives: list[str], suggestions: list[str]) -> str:
+        if positives and (negatives or suggestions):
+            return "mixed"
+        if negatives or suggestions:
+            return "negative"
+        if positives:
+            return "positive"
+        return "mixed"
 
     @classmethod
     def generate_human_followup_question(
@@ -364,7 +651,7 @@ class FallbackClassifier:
         elif detected_issue_type == "technical":
             question = "What happened right before it failed?"
         elif detected_issue_type == "quality":
-            question = f"What felt most off about the {task_type or 'result'}?"
+            question = "Which concrete detail should change first?"
         elif detected_issue_type == "usability":
             question = "Which step felt the most confusing?"
         elif prompt and ai_output and not cls._looks_aligned(prompt, ai_output):
@@ -372,7 +659,7 @@ class FallbackClassifier:
         elif existing_suggestions:
             question = "Which change would help the most first?"
         elif existing_negatives or any(token in normalized_feedback for token in {"not", "didn't", "wrong", "off"}):
-            question = "What stood out as the main problem?"
+            question = "Which concrete detail matters most here?"
         else:
             question = f"What worked best in the {task_type or 'output'}?"
 
@@ -484,7 +771,7 @@ class FeedbackLLMService:
             extraction = self._extraction_chain.invoke({"message": message})
             if not extraction.issue_tags:
                 extraction.issue_tags = self.generate_issue_tags(message)
-            return extraction
+            return FallbackClassifier.refine_feedback(message, extraction)
         return FallbackClassifier.extract_feedback(message)
 
     def classify_issue(self, message: str) -> IssueClassification:
@@ -494,7 +781,7 @@ class FeedbackLLMService:
 
     def generate_issue_tags(self, message: str) -> list[str]:
         if self._tag_chain:
-            return self._tag_chain.invoke({"message": message}).issue_tags
+            return FallbackClassifier._best_issue_tags(message, [], [], [], self._tag_chain.invoke({"message": message}).issue_tags)
         return FallbackClassifier.generate_issue_tags(message)
 
     def generate_human_followup_question(self, **payload) -> HumanFollowupQuestionResult:
