@@ -261,6 +261,11 @@ class ChatService:
     ) -> str:
         extracted = self.llm_service.extract_feedback(user_input)
         extracted = self._filter_extraction_to_current_evidence(conversation, user_input, extracted)
+        if not self._has_extractable_feedback(extracted):
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_state("irrelevant_feedback_candidate", conversation, user_input)
+            return self._respond(conversation, self._build_off_track_response(conversation, question=self._is_question(user_input)))
+
         issue = self.llm_service.classify_issue(user_input)
         positive_only = self._is_positive_only_feedback(extracted)
         issue_type_for_storage = "none" if positive_only else issue.issue_type
@@ -373,6 +378,15 @@ class ChatService:
         user_input: str,
         extracted: FeedbackExtraction,
     ) -> FeedbackExtraction:
+        if not self._is_feedback_relevant_to_session(conversation, user_input, extracted):
+            return FeedbackExtraction(
+                sentiment="mixed",
+                positives=[],
+                negatives=[],
+                suggestions=[],
+                issue_tags=[],
+            )
+
         evidence_text = self._current_classification_evidence(conversation, user_input, extracted)
         supported_tags = [
             tag
@@ -388,6 +402,103 @@ class ChatService:
             suggestions=extracted.suggestions,
             issue_tags=supported_tags or ["other"],
         )
+
+    def _is_feedback_relevant_to_session(
+        self,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+    ) -> bool:
+        normalized = user_input.strip().lower()
+        if not normalized:
+            return False
+
+        direct_targets = {
+            "ai",
+            "app",
+            "application",
+            "experience",
+            "generated",
+            "generation",
+            "image",
+            "output",
+            "prompt",
+            "result",
+            "render",
+            "photo",
+            "picture",
+            "slide",
+            "video",
+            "audio",
+            "document",
+            "model",
+            "tool",
+            "color",
+            "colors",
+            "lighting",
+            "composition",
+            "style",
+            "texture",
+            "subject",
+            "person",
+            "scene",
+            "readability",
+        }
+        if any(self._evidence_contains(normalized, target) for target in direct_targets):
+            return True
+
+        if extracted.issue_tags and any(tag != "other" for tag in extracted.issue_tags):
+            evidence_text = self._current_classification_evidence(conversation, user_input, extracted)
+            if any(self._issue_tag_supported_by_current_evidence(tag, evidence_text) for tag in extracted.issue_tags):
+                return True
+
+        if extracted.negatives or extracted.suggestions:
+            issue_terms = self._extract_issue_terms(user_input, extracted)
+            if issue_terms:
+                return True
+
+        prompt_tokens = self._meaningful_prompt_tokens(conversation.prompt or "")
+        message_tokens = self._meaningful_prompt_tokens(user_input)
+        if prompt_tokens and message_tokens and prompt_tokens & message_tokens:
+            return True
+
+        return False
+
+    @staticmethod
+    def _meaningful_prompt_tokens(text: str) -> set[str]:
+        stopwords = {
+            "about",
+            "after",
+            "also",
+            "and",
+            "are",
+            "but",
+            "for",
+            "from",
+            "have",
+            "like",
+            "look",
+            "looked",
+            "make",
+            "more",
+            "not",
+            "that",
+            "the",
+            "there",
+            "this",
+            "was",
+            "were",
+            "what",
+            "with",
+            "would",
+            "should",
+            "could",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", text.lower())
+            if len(token) >= 4 and token not in stopwords
+        }
 
     def _handle_rating_turn(self, conversation: Conversation, rating_result: RatingExtraction) -> str:
         if self._get_context_value(conversation, "rating") is not None:

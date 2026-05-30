@@ -489,9 +489,21 @@ class FallbackClassifier:
             "unrealistic",
             "rating",
             "score",
+            "color",
+            "colors",
+            "lighting",
+            "composition",
+            "style",
+            "texture",
+            "subject",
+            "person",
+            "scene",
+            "readability",
         }
         if any(term in normalized for term in feedback_terms):
             return False
+        if re.search(r"\bi\s+(?:like|love|prefer|enjoy|hate|dislike)\b", normalized):
+            return True
         return any(hint in normalized for hint in cls.OFF_TOPIC_HINTS)
 
     @classmethod

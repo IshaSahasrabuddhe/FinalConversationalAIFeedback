@@ -14,6 +14,7 @@ Rules:
 - Mark intent as "feedback" when the user gives any opinion, complaint, suggestion, praise, or problem report.
 - Mark intent as "rating" only when the message is mainly a score such as "3", "I'd rate it 4", or "2/5".
 - Mark intent as "off_topic" when it does not contribute feedback or rating, including casual questions like "what is your name?" or "how are you?"
+- Mark personal preferences or general statements as off_topic when they are not tied to the generated output, prompt, or application experience, e.g. "I like matcha".
 - If the message contains both feedback and rating, prefer intent="feedback".
 - Pure praise is feedback with positive sentiment and issue_type="none" unless it also includes a problem or requested improvement.
 - Treat emotional mismatch, missing vibe, warmth, mood, tone, realism, or atmosphere as feedback.
@@ -82,6 +83,7 @@ Return strict JSON only in this format:
 Extraction rules:
 - Capture multiple insights from one message.
 - Ignore noise or irrelevant filler.
+- Ignore personal preferences or vague conversation that are not about the generated output, prompt, or application experience, e.g. "I like matcha".
 - Use short concrete phrases grounded in the user's wording.
 - Split mixed statements carefully. Text before "but/however/though" may be positive while text after it may be negative.
 - positives: only things the user explicitly liked, praised, or said worked.
