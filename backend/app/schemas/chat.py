@@ -31,6 +31,13 @@ class ChatRequest(BaseModel):
     ai_output: str | None = Field(default=None, max_length=12000)
 
 
+class FeedbackStartRequest(BaseModel):
+    conversation_id: int
+    task_type: TaskType | None = None
+    prompt: str | None = Field(default=None, max_length=12000)
+    ai_output: str | None = Field(default=None, max_length=12000)
+
+
 class MessageResponse(BaseModel):
     id: int
     role: MessageRole

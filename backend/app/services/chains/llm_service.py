@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Type, TypeVar
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -131,9 +132,44 @@ class FallbackClassifier:
         "unnatural",
         "weak",
         "hollow",
+        "unreadable",
+        "illegible",
+        "label",
+        "labels",
+        "chart",
+        "graph",
+        "logo",
+        "typography",
+        "ignored",
+        "instruction",
+        "instructions",
+        "monitor",
+        "monitors",
+        "headphones",
+        "sticky notes",
+        "desk plant",
+        "objects",
+        "elements",
+        "contained",
     }
     VAGUE_RATING_HINTS = {"okay", "ok", "fine", "average", "decent", "not bad", "so so", "its okay", "it's okay"}
     STOP_HINTS = {"no", "no more", "stop", "that's it", "thats it", "nothing else", "no thanks"}
+    OFF_TOPIC_HINTS = {
+        "what should i wear",
+        "what should i eat",
+        "do you like",
+        "tell me a joke",
+        "recommend a restaurant",
+        "restaurant",
+        "outfit",
+        "denim",
+        "jeans",
+        "fashion",
+        "how are you",
+        "what is your name",
+        "what's your name",
+        "who are you",
+    }
     TECHNICAL_HINTS = {
         "bug",
         "error",
@@ -187,11 +223,40 @@ class FallbackClassifier:
         "fake",
         "staged",
         "unnatural",
+        "unreadable",
+        "illegible",
+        "label",
+        "labels",
+        "chart",
+        "graph",
+        "logo",
+        "typography",
+        "readability",
+        "ignored",
+        "instruction",
+        "instructions",
+        "monitor",
+        "monitors",
+        "headphones",
+        "sticky notes",
+        "desk plant",
+        "objects",
+        "elements",
+        "contained",
+        "followed",
     }
     USABILITY_HINTS = {"hard", "confusing", "confused", "ui", "ux", "difficult", "unclear", "find", "navigation", "use"}
 
     @classmethod
     def analyze_turn(cls, message: str) -> ConversationTurnAnalysis:
+        if cls._is_off_topic_message(message):
+            return ConversationTurnAnalysis(
+                intent="off_topic",
+                issue_type="none",
+                sentiment="mixed",
+                is_feedback_present=False,
+            )
+
         rating_result = cls.extract_rating(message)
         extracted = cls.extract_feedback(message)
         issue = cls.classify_issue(message)
@@ -228,22 +293,19 @@ class FallbackClassifier:
 
         if normalized in cls.STOP_HINTS:
             return RatingExtraction(rating=None, is_vague=False, clarification_needed="")
-        if any(phrase in normalized for phrase in cls.VAGUE_RATING_HINTS):
+        if any(phrase in normalized for phrase in {"generate 2 images", "two images", "multiple images"}):
+            return RatingExtraction(rating=None, is_vague=False, clarification_needed="")
+        rating = cls._extract_explicit_rating(normalized)
+        if rating is not None:
+            return RatingExtraction(rating=rating, is_vague=False, clarification_needed="")
+        if cls._has_vague_rating_hint(normalized):
             return RatingExtraction(
                 rating=None,
                 is_vague=True,
                 clarification_needed="Please share a rating from 1 to 5, where 1 is very poor and 5 is excellent.",
             )
 
-        tokens = message.replace("/", " ").split()
-        for token in tokens:
-            cleaned = "".join(ch for ch in token if ch.isdigit())
-            if cleaned.isdigit():
-                rating = int(cleaned)
-                if 1 <= rating <= 5:
-                    return RatingExtraction(rating=rating, is_vague=False, clarification_needed="")
-
-        if any(cue in normalized for cue in rating_cues):
+        if cls._has_rating_cue(normalized):
             return RatingExtraction(
                 rating=None,
                 is_vague=True,
@@ -251,6 +313,33 @@ class FallbackClassifier:
             )
 
         return RatingExtraction(rating=None, is_vague=False, clarification_needed="")
+
+    @staticmethod
+    def _has_rating_cue(normalized: str) -> bool:
+        return bool(
+            re.search(r"\b(?:rate|rating|score|stars?)\b|/5|\bout\s+of\s+5\b", normalized)
+        )
+
+    @classmethod
+    def _has_vague_rating_hint(cls, normalized: str) -> bool:
+        tokens = {"".join(ch for ch in token if ch.isalnum() or ch == "'") for token in normalized.split()}
+        if tokens & {"okay", "ok", "fine", "average", "decent"}:
+            return True
+        return bool(re.search(r"\bnot\s+bad\b|\bso\s+so\b|\bits\s+okay\b|\bit's\s+okay\b", normalized))
+
+    @staticmethod
+    def _extract_explicit_rating(normalized: str) -> int | None:
+        patterns = [
+            r"^\s*(?:probably|maybe|around|about)?\s*(?:a\s+)?([1-5])(?:\b|(?=\s*/\s*5)|(?=\s*[-.:]))",
+            r"\b(?:rate|rating|score|stars?|give|gave|giving)\s+(?:it\s+)?(?:a\s+)?([1-5])(?:\b|(?=\s*/\s*5))",
+            r"\b(?:would|would probably|probably|maybe)\s+(?:give|rate)\s+(?:it\s+)?(?:a\s+)?([1-5])(?:\b|(?=\s*/\s*5))",
+            r"\b([1-5])\s*/\s*5\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                return int(match.group(1))
+        return None
 
     @classmethod
     def analyze_sentiment(cls, message: str) -> SentimentAnalysis:
@@ -269,6 +358,9 @@ class FallbackClassifier:
 
     @classmethod
     def extract_feedback(cls, message: str) -> FeedbackExtraction:
+        if cls._is_off_topic_message(message):
+            return FeedbackExtraction(sentiment="mixed", positives=[], negatives=[], suggestions=[], issue_tags=[])
+
         clauses = cls._feedback_clauses(message)
         positives: list[str] = []
         negatives: list[str] = []
@@ -372,7 +464,35 @@ class FallbackClassifier:
 
     @classmethod
     def generate_issue_tags(cls, message: str) -> list[str]:
+        if cls._is_off_topic_message(message):
+            return []
         return cls._best_issue_tags(message, [], [], [], [])
+
+    @classmethod
+    def _is_off_topic_message(cls, message: str) -> bool:
+        normalized = message.strip().lower().strip("?.! ")
+        if not normalized:
+            return False
+        feedback_terms = {
+            "ai",
+            "app",
+            "application",
+            "feedback",
+            "generated",
+            "image",
+            "output",
+            "prompt",
+            "result",
+            "quality",
+            "realism",
+            "realistic",
+            "unrealistic",
+            "rating",
+            "score",
+        }
+        if any(term in normalized for term in feedback_terms):
+            return False
+        return any(hint in normalized for hint in cls.OFF_TOPIC_HINTS)
 
     @classmethod
     def _best_issue_tags(
@@ -390,6 +510,9 @@ class FallbackClassifier:
             if tag not in tags:
                 tags.append(tag)
 
+        def has_any(tokens: set[str]) -> bool:
+            return any(cls._evidence_contains(normalized, token) for token in tokens)
+
         blocked_generic = {
             "lack_of_realism",
             "realism_issue",
@@ -402,9 +525,45 @@ class FallbackClassifier:
             "visual_style_feedback",
         }
         for tag in existing_tags:
-            if tag and tag not in blocked_generic:
+            if tag and tag not in blocked_generic and cls._tag_supported_by_evidence(tag, normalized):
                 add(tag)
 
+        if has_any({"unreadable", "illegible", "hard to read", "could not read", "can't read", "text"}):
+            add("text_rendering")
+            add("readability")
+            add("typography_fidelity")
+        if has_any({"label", "labels", "caption", "captions", "annotation", "annotations"}):
+            add("label_fidelity")
+            if has_any({"incorrect", "inaccurate", "wrong", "mislabeled", "mislabelled"}):
+                add("information_accuracy")
+                add("content_correctness")
+        if has_any({"chart", "charts", "graph", "graphs", "axis", "axes", "legend", "plot"}):
+            add("data_visualization_quality")
+            add("chart_readability")
+        if any(token in normalized for token in {"logo", "brand", "branding", "wordmark"}):
+            add("branding_fidelity")
+            add("logo_accuracy")
+        if any(token in normalized for token in {"subject", "main subject", "not what i asked", "not what i asked for", "did not match", "does not match"}):
+            add("subject_mismatch")
+        if any(token in normalized for token in {"person", "character"}) and any(token in normalized for token in {"did not match", "does not match", "wrong"}):
+            add("character_mismatch")
+        if "japanese" in normalized and any(token in normalized for token in {"person did not match", "did not match", "wrong person"}):
+            add("identity_mismatch")
+        if "elderly" in normalized and any(token in normalized for token in {"person did not match", "did not match", "wrong person", "not what i asked"}):
+            add("age_mismatch")
+        if any(token in normalized for token in {"description", "attribute", "attributes", "did not match", "does not match"}):
+            add("attribute_mismatch")
+        if any(token in normalized for token in {"missing", "missed", "ignored", "left out", "left-out", "omitted", "not included"}):
+            if any(token in normalized for token in {"object", "objects", "element", "elements", "monitor", "monitors", "headphones", "sticky notes", "desk plant"}):
+                add("missing_objects")
+                add("missing_elements")
+            add("prompt_adherence")
+            add("instruction_following")
+        if any(token in normalized for token in {"instruction", "instructions", "followed", "prompt", "should have contained", "asked for", "requested"}):
+            add("prompt_adherence")
+            add("instruction_following")
+        if any(token in normalized for token in {"object count", "count", "three monitors", "two monitors", "too few", "too many"}):
+            add("object_count_errors")
         if any(token in normalized for token in {"navigation", "hard to find", "difficult to find"}):
             add("navigation_difficulty")
         if any(token in normalized for token in {"slow", "minutes", "delay", "took"}):
@@ -413,11 +572,15 @@ class FallbackClassifier:
             add("multiple_output_request")
         if any(token in normalized for token in {"crash", "error", "freeze", "broken"}):
             add("runtime_failure")
-        if any(token in normalized for token in {"incorrect", "inaccurate", "wrong"}):
+        if any(token in normalized for token in {"missed prompt", "prompt", "did not follow", "didn't follow"}):
             add("prompt_alignment")
         if any(token in normalized for token in {"empty", "density", "crowd", "crowds", "busy", "alive", "activity", "drones", "traffic"}):
             add("environmental_density")
-        if any(token in normalized for token in {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable", "realism", "realistic", "unrealistic"}):
+        realism_complaint = (
+            any(token in normalized for token in {"unrealistic", "not realistic", "fake", "artificial"})
+            or ("realism" in normalized and any(token in normalized for token in {"missing", "lacked", "weak", "breaks", "issue", "problem"}))
+        )
+        if any(token in normalized for token in {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable"}) or realism_complaint:
             add("environmental_realism")
         if any(token in normalized for token in {"motion", "movement", "moving", "static", "frozen", "action"}):
             add("motion_realism")
@@ -446,10 +609,66 @@ class FallbackClassifier:
         if any(token in normalized for token in {"sharp", "sharpness", "blurry", "detail", "details"}):
             add("detail_sharpness")
 
-        if not tags and any(token in normalized for token in {"realism", "realistic", "unrealistic"}):
+        if not tags and realism_complaint:
             add("environmental_believability")
 
         return tags[:5]
+
+    @staticmethod
+    def _tag_supported_by_evidence(tag: str, normalized: str) -> bool:
+        evidence_by_tag = {
+            "text_rendering": {"text", "unreadable", "illegible", "read", "font", "type", "typography"},
+            "typography_fidelity": {"text", "font", "type", "typography", "unreadable", "illegible"},
+            "readability": {"read", "readable", "unreadable", "illegible", "text", "label"},
+            "information_accuracy": {"incorrect", "inaccurate", "wrong", "label", "labels", "content", "data"},
+            "label_fidelity": {"label", "labels", "caption", "annotation", "mislabeled", "mislabelled"},
+            "content_correctness": {"incorrect", "inaccurate", "wrong", "content", "label", "labels"},
+            "data_visualization_quality": {"chart", "charts", "graph", "graphs", "axis", "axes", "legend", "plot", "data"},
+            "chart_readability": {"chart", "charts", "graph", "graphs", "axis", "axes", "legend"},
+            "branding_fidelity": {"logo", "brand", "branding", "wordmark"},
+            "logo_accuracy": {"logo", "brand", "branding", "wordmark"},
+            "subject_mismatch": {"subject", "main subject", "not what i asked", "not what i asked for", "did not match", "does not match"},
+            "character_mismatch": {"person", "character", "man", "woman", "did not match", "description"},
+            "identity_mismatch": {"identity", "japanese", "wrong person", "person did not match"},
+            "age_mismatch": {"elderly", "old", "young", "age", "aged"},
+            "attribute_mismatch": {"description", "attribute", "attributes", "did not match"},
+            "prompt_adherence": {"missing", "missed", "ignored", "instruction", "instructions", "followed", "prompt", "requested", "asked for", "should have contained"},
+            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
+            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements", "object", "objects"},
+            "instruction_following": {"ignored", "instruction", "instructions", "followed", "prompt", "requested", "asked for", "should have contained"},
+            "object_count_errors": {"object count", "count", "three monitors", "two monitors", "too few", "too many"},
+            "environmental_density": {"empty", "density", "crowd", "crowds", "busy", "alive", "activity", "drones", "traffic"},
+            "environmental_realism": {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable", "realism", "realistic", "unrealistic"},
+            "environmental_believability": {"environment", "city", "street", "scene", "believable", "realism", "realistic", "unrealistic"},
+            "motion_realism": {"motion", "movement", "moving", "static", "frozen", "action"},
+            "lighting_consistency": {"lighting", "light", "shadow", "falloff", "glow", "neon"},
+            "texture_realism": {"texture", "surface", "grain"},
+            "material_realism": {"material", "metal", "metallic", "fabric", "skin", "plastic"},
+            "reflection_realism": {"reflection", "reflections", "reflective", "mirror"},
+            "scale_consistency": {"scale", "massive", "size", "proportion", "proportions"},
+            "atmospheric_depth": {"depth", "atmospheric", "haze", "distance", "falloff"},
+            "interaction_realism": {"interaction", "integrated", "integration", "natural behavior", "unnatural"},
+            "composition_balance": {"composition", "framing", "balance", "layout"},
+            "perspective_consistency": {"perspective", "aerial", "angle", "vanishing"},
+            "anatomy_accuracy": {"anatomy", "body", "limb", "face", "hand", "pose"},
+            "cinematic_alignment": {"cinematic", "film", "mood", "atmosphere", "cyberpunk", "neon", "visual style", "style"},
+            "detail_sharpness": {"sharp", "sharpness", "blurry", "detail", "details"},
+            "prompt_alignment": {"prompt", "missed prompt", "did not follow", "didn't follow", "ignored"},
+            "navigation_difficulty": {"navigation", "hard to find", "difficult to find"},
+            "slow_response_time": {"slow", "minutes", "delay", "took"},
+            "runtime_failure": {"crash", "error", "freeze", "broken"},
+            "multiple_output_request": {"generate 2 images", "two images", "multiple images"},
+        }
+        allowed_terms = evidence_by_tag.get(tag)
+        if not allowed_terms:
+            return tag == "other"
+        return any(FallbackClassifier._evidence_contains(normalized, term) for term in allowed_terms)
+
+    @staticmethod
+    def _evidence_contains(evidence_text: str, token: str) -> bool:
+        if " " in token or "-" in token:
+            return token in evidence_text
+        return bool(re.search(rf"\b{re.escape(token)}\b", evidence_text))
 
     @classmethod
     def _feedback_clauses(cls, message: str) -> list[str]:
@@ -487,13 +706,13 @@ class FallbackClassifier:
             }
         )
 
-    @staticmethod
-    def _has_suggestion_signal(text: str) -> bool:
+    @classmethod
+    def _has_suggestion_signal(cls, text: str) -> bool:
+        if cls._is_observation_with_modal(text):
+            return False
         return any(
             token in text
             for token in {
-                "should",
-                "could",
                 "improve",
                 "better",
                 "add",
@@ -508,7 +727,27 @@ class FallbackClassifier:
                 "city activity",
                 "environmental density",
             }
+        ) or bool(
+            re.search(
+                r"\b(?:model|system|app|tool|generator|ai)\s+(?:should|could|would need to|needs to)\b",
+                text,
+            )
         )
+
+    @staticmethod
+    def _is_observation_with_modal(text: str) -> bool:
+        observation_patterns = {
+            "should have contained",
+            "should have included",
+            "should include",
+            "would have contained",
+            "could have contained",
+            "was supposed to",
+            "were supposed to",
+            "needed to show",
+            "needed to include",
+        }
+        return any(pattern in text for pattern in observation_patterns)
 
     @classmethod
     def _has_feedback_signal(cls, text: str) -> bool:
@@ -528,6 +767,13 @@ class FallbackClassifier:
                     "felt",
                     "experience",
                     "feedback",
+                    "ignored",
+                    "instruction",
+                    "instructions",
+                    "contained",
+                    "missing",
+                    "objects",
+                    "elements",
                 }
             )
         )
@@ -535,6 +781,7 @@ class FallbackClassifier:
     @staticmethod
     def _clean_feedback_phrase(text: str) -> str:
         cleaned = " ".join(text.strip(" ,.;:-").split())
+        cleaned = re.sub(r"^(?:probably\s+|maybe\s+|around\s+|about\s+)?(?:a\s+)?[1-5](?:\s*/\s*5)?\s*(?:because|[-.:])?\s*", "", cleaned, flags=re.IGNORECASE).strip()
         for prefix in ("but ", "and ", "also ", "the "):
             if cleaned.lower().startswith(prefix):
                 cleaned = cleaned[len(prefix):].strip()
@@ -558,11 +805,34 @@ class FallbackClassifier:
 
         if "empty" in normalized:
             negatives.append("scene felt empty")
+        if any(token in normalized for token in {"unreadable", "illegible", "hard to read", "could not read", "can't read"}):
+            negatives.append("text was unreadable")
+        if "text" in normalized and any(token in normalized for token in {"wrong", "incorrect", "inaccurate"}):
+            negatives.append("text content was incorrect")
+        if any(token in normalized for token in {"label", "labels"}) and any(token in normalized for token in {"wrong", "incorrect", "inaccurate", "mislabeled", "mislabelled"}):
+            negatives.append("labels were incorrect")
+        if any(token in normalized for token in {"chart", "charts", "graph", "graphs"}) and any(token in normalized for token in {"unclear", "unreadable", "confusing", "wrong", "incorrect"}):
+            negatives.append("chart was hard to interpret")
+        if any(token in normalized for token in {"logo", "brand", "branding"}) and any(token in normalized for token in {"wrong", "incorrect", "off", "inaccurate"}):
+            negatives.append("branding was inaccurate")
+        if any(token in normalized for token in {"main subject", "subject", "person"}) and any(token in normalized for token in {"not what i asked", "not what i asked for", "did not match", "does not match"}):
+            negatives.append("subject did not match the prompt")
+        if "person did not match" in normalized or "person does not match" in normalized:
+            negatives.append("person did not match the prompt description")
+        if any(token in normalized for token in {"missing", "missed", "ignored", "left out", "omitted"}):
+            if any(token in normalized for token in {"monitor", "monitors", "headphones", "sticky notes", "desk plant", "object", "objects", "element", "elements"}):
+                negatives.append("requested objects were missing")
+            if any(token in normalized for token in {"instruction", "instructions", "prompt", "requested", "asked for"}):
+                negatives.append("prompt instructions were not fully followed")
+        if "should have contained" in normalized:
+            negatives.append(cls._clean_feedback_phrase(message))
         if "density" in normalized or "crowd" in normalized or "crowds" in normalized:
             negatives.append("lacked environmental density")
         if any(token in normalized for token in {"motion", "movement", "moving crowds", "active drones", "static"}):
             negatives.append("motion felt static")
-        if any(token in normalized for token in {"realism", "realistic", "unrealistic"}):
+        if any(token in normalized for token in {"unrealistic", "not realistic"}) or (
+            "realism" in normalized and any(token in normalized for token in {"weak", "issue", "problem", "breaks", "missing"})
+        ):
             negatives.append("realism weakened")
         if "texture" in normalized:
             negatives.append("textures looked artificial")

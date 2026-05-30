@@ -1,7 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { createConversation, getHistory, listConversations, sendMessage, sendMessageWithUpload } from "../api/chat";
+import {
+  createConversation,
+  getHistory,
+  listConversations,
+  sendMessage,
+  sendMessageWithUpload,
+  startFeedback,
+  startFeedbackWithUpload,
+} from "../api/chat";
 import ChatWindow from "../components/ChatWindow";
 import ConversationList from "../components/ConversationList";
 import { useAuth } from "../context/AuthContext";
@@ -26,10 +34,38 @@ export default function DashboardPage() {
   const [selectedOutputFile, setSelectedOutputFile] = useState<File | null>(null);
   const [currentState, setCurrentState] = useState<string>("START");
   const [loading, setLoading] = useState(false);
+  const autoStartKeyRef = useRef("");
 
   useEffect(() => {
     void hydrate();
   }, []);
+
+  useEffect(() => {
+    if (!activeConversationId || loading || metadata.is_locked || currentState !== "START") {
+      return;
+    }
+
+    const hasPrompt = Boolean(metadata.prompt.trim());
+    const isTextTask = metadata.task_type === "text" || !metadata.task_type;
+    const hasOutput = isTextTask ? Boolean(metadata.ai_output.trim()) : Boolean(selectedOutputFile);
+    if (!hasPrompt || !hasOutput) {
+      return;
+    }
+
+    const autoStartKey = [
+      activeConversationId,
+      metadata.task_type ?? "text",
+      metadata.prompt,
+      metadata.ai_output,
+      selectedOutputFile?.name ?? "",
+      selectedOutputFile?.size ?? 0,
+    ].join("|");
+    if (autoStartKeyRef.current === autoStartKey) {
+      return;
+    }
+    autoStartKeyRef.current = autoStartKey;
+    void handleStartFeedback();
+  }, [activeConversationId, currentState, loading, metadata, selectedOutputFile]);
 
   async function hydrate() {
     setLoading(true);
@@ -107,6 +143,27 @@ export default function DashboardPage() {
         needsUploadRoute && payloadMetadata
           ? await sendMessageWithUpload(activeConversationId, userDraft, payloadMetadata, selectedOutputFile)
           : await sendMessage(activeConversationId, userDraft, payloadMetadata);
+      const history = await getHistory(response.conversation_id);
+      applyHistory(history);
+      setCurrentState(response.state);
+      setConversations(await listConversations());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleStartFeedback() {
+    if (!activeConversationId || metadata.is_locked) {
+      return;
+    }
+
+    const needsUploadRoute = metadata.task_type !== "text" && Boolean(selectedOutputFile);
+    setLoading(true);
+
+    try {
+      const response = needsUploadRoute
+        ? await startFeedbackWithUpload(activeConversationId, metadata, selectedOutputFile)
+        : await startFeedback(activeConversationId, metadata);
       const history = await getHistory(response.conversation_id);
       applyHistory(history);
       setCurrentState(response.state);

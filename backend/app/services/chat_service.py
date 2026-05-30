@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -30,7 +31,7 @@ class ChatService:
         )
         self.db.add(conversation)
         self.db.flush()
-        assistant_message = self._advance_without_user_message(conversation)
+        assistant_message = ""
         self.db.commit()
         self.db.refresh(conversation)
         return conversation, assistant_message
@@ -61,7 +62,7 @@ class ChatService:
             prompt=conversation.prompt or "",
             ai_output=conversation.ai_output or "",
             ai_output_file_url=conversation.ai_output_file_url or "",
-            is_locked=self._metadata_locked(conversation) or any(message.role == MessageRole.USER for message in conversation.messages),
+            is_locked=self._metadata_locked(conversation),
         )
 
     def process_message(
@@ -103,7 +104,45 @@ class ChatService:
             )
         )
 
+        if not self._has_required_feedback_inputs(conversation):
+            conversation.state = ConversationState.START
+            assistant_message = self._respond(conversation, self._build_waiting_for_inputs_response(conversation))
+            self.db.commit()
+            self.db.refresh(conversation)
+            return conversation, assistant_message
+
         assistant_message = self._advance_state(conversation, cleaned_content)
+        self.db.commit()
+        self.db.refresh(conversation)
+        return conversation, assistant_message
+
+    def start_feedback_session(
+        self,
+        user: User,
+        conversation_id: int,
+        *,
+        task_type: str | None = None,
+        prompt: str | None = None,
+        ai_output: str | None = None,
+        ai_output_file_url: str | None = None,
+    ) -> tuple[Conversation, str]:
+        conversation = self.get_conversation(user, conversation_id)
+        self._store_metadata_on_first_message(
+            conversation,
+            task_type=task_type,
+            prompt=prompt,
+            ai_output=ai_output,
+            ai_output_file_url=ai_output_file_url,
+        )
+
+        if not self._has_required_feedback_inputs(conversation):
+            conversation.state = ConversationState.START
+            assistant_message = self._respond(conversation, self._build_waiting_for_inputs_response(conversation))
+        elif conversation.state == ConversationState.START:
+            assistant_message = self._advance_without_user_message(conversation)
+        else:
+            assistant_message = "Feedback is already in progress. You can continue sharing what worked or what did not."
+
         self.db.commit()
         self.db.refresh(conversation)
         return conversation, assistant_message
@@ -140,19 +179,56 @@ class ChatService:
         if previous_state == ConversationState.START:
             return self._advance_without_user_message(conversation)
 
+        rating_already_captured = self._get_context_value(conversation, "rating") is not None
+        rating_result = None
+        rating_stored_this_turn = False
+        if not rating_already_captured:
+            rating_result = self.llm_service.extract_rating(user_input)
+            if rating_result.rating is not None:
+                self._set_rating(conversation, rating_result.rating)
+                rating_already_captured = True
+                rating_stored_this_turn = True
+
         if self._is_off_topic_question(user_input):
             conversation.state = ConversationState.FEEDBACK_CONTINUE
             self._log_state("off_topic", conversation, user_input)
             return self._respond(conversation, self._build_off_track_response(conversation, question=True))
+
+        if self._is_obvious_off_topic_message(user_input):
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_state("obvious_off_topic", conversation, user_input)
+            return self._respond(conversation, self._build_off_track_response(conversation, question=self._is_question(user_input)))
+
+        if previous_state in {ConversationState.ASK_RATING, ConversationState.HANDLE_VAGUE_RATING}:
+            rating_result = rating_result or self.llm_service.extract_rating(user_input)
+            if rating_result.is_vague or (rating_result.rating is not None and not rating_stored_this_turn):
+                reply = self._handle_rating_turn(conversation, rating_result)
+                self._log_state("rating_state", conversation, user_input)
+                return reply
 
         if self._is_vague_acknowledgement(user_input):
             conversation.state = ConversationState.FEEDBACK_CONTINUE
             self._log_state("vague_ack", conversation, user_input)
             return self._respond(conversation, self._build_off_track_response(conversation, question=False))
 
-        rating_already_captured = self._get_context_value(conversation, "rating") is not None
         conversation.state = ConversationState.PRE_FEEDBACK_ANALYSIS
         analysis = self.llm_service.analyze_turn(user_input)
+
+        if analysis.intent == "off_topic" or not analysis.is_feedback_present:
+            if rating_stored_this_turn and rating_result and rating_result.rating is not None:
+                conversation.state = ConversationState.FEEDBACK_CONTINUE
+                self._log_state("rating_only", conversation, user_input)
+                return self._respond(conversation, self._build_post_rating_prompt(rating_result.rating))
+            if self._is_rating_like_message(user_input):
+                if not rating_already_captured:
+                    rating_result = self.llm_service.extract_rating(user_input)
+                    if rating_result.rating is not None or rating_result.is_vague:
+                        reply = self._handle_rating_turn(conversation, rating_result)
+                        self._log_state("after_rating", conversation, user_input)
+                        return reply
+            conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_state("analysis_off_topic", conversation, user_input)
+            return self._respond(conversation, self._build_off_track_response(conversation, question=self._is_question(user_input)))
 
         if analysis.is_feedback_present:
             reply = self._handle_feedback_turn(conversation, user_input, analysis, previous_state)
@@ -160,7 +236,7 @@ class ChatService:
             return reply
 
         if not rating_already_captured:
-            rating_result = self.llm_service.extract_rating(user_input)
+            rating_result = rating_result or self.llm_service.extract_rating(user_input)
             if rating_result.rating is not None or rating_result.is_vague:
                 reply = self._handle_rating_turn(conversation, rating_result)
                 self._log_state("after_rating", conversation, user_input)
@@ -184,6 +260,7 @@ class ChatService:
         previous_state: ConversationState,
     ) -> str:
         extracted = self.llm_service.extract_feedback(user_input)
+        extracted = self._filter_extraction_to_current_evidence(conversation, user_input, extracted)
         issue = self.llm_service.classify_issue(user_input)
         positive_only = self._is_positive_only_feedback(extracted)
         issue_type_for_storage = "none" if positive_only else issue.issue_type
@@ -290,6 +367,28 @@ class ChatService:
         )
         return self._respond(conversation, reply)
 
+    def _filter_extraction_to_current_evidence(
+        self,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+    ) -> FeedbackExtraction:
+        evidence_text = self._current_classification_evidence(conversation, user_input, extracted)
+        supported_tags = [
+            tag
+            for tag in extracted.issue_tags
+            if self._issue_tag_supported_by_current_evidence(tag, evidence_text)
+        ]
+        if supported_tags == extracted.issue_tags:
+            return extracted
+        return FeedbackExtraction(
+            sentiment=extracted.sentiment,
+            positives=extracted.positives,
+            negatives=extracted.negatives,
+            suggestions=extracted.suggestions,
+            issue_tags=supported_tags or ["other"],
+        )
+
     def _handle_rating_turn(self, conversation: Conversation, rating_result: RatingExtraction) -> str:
         if self._get_context_value(conversation, "rating") is not None:
             conversation.state = ConversationState.FEEDBACK_CONTINUE
@@ -310,6 +409,8 @@ class ChatService:
 
     def _set_rating(self, conversation: Conversation, rating: int) -> None:
         self._set_context_value(conversation, "rating", rating)
+        self._set_context_value(conversation, "rating_collected", True)
+        self._set_context_value(conversation, "rating_prompt_asked", True)
         self._update_feedback_ratings(conversation, rating)
 
     def _update_feedback_ratings(self, conversation: Conversation, rating: int) -> None:
@@ -411,6 +512,7 @@ class ChatService:
     def _default_context(self) -> dict:
         return {
             "rating": None,
+            "rating_collected": False,
             "active_issue_type": "none",
             "last_issue_tags": [],
             "last_sentiment": "mixed",
@@ -926,7 +1028,7 @@ class ChatService:
 
     def _is_off_topic_question(self, user_input: str) -> bool:
         raw = user_input.strip().lower()
-        is_question = raw.endswith("?")
+        is_question = self._is_question(user_input)
         normalized = raw.strip("?.! ")
         if not normalized:
             return False
@@ -940,6 +1042,8 @@ class ChatService:
             "are you ai",
             "who made you",
             "what can you do",
+            "tell me a joke",
+            "recommend a restaurant",
         }
         if normalized in off_topic_patterns:
             return True
@@ -960,6 +1064,76 @@ class ChatService:
             }
         )
 
+    @staticmethod
+    def _is_question(user_input: str) -> bool:
+        return user_input.strip().endswith("?")
+
+    def _is_obvious_off_topic_message(self, user_input: str) -> bool:
+        normalized = user_input.strip().lower().strip("?.! ")
+        if not normalized:
+            return False
+
+        feedback_terms = {
+            "ai",
+            "app",
+            "application",
+            "experience",
+            "feedback",
+            "generated",
+            "image",
+            "output",
+            "prompt",
+            "result",
+            "improve",
+            "issue",
+            "problem",
+            "quality",
+            "realism",
+            "realistic",
+            "unrealistic",
+        }
+        if any(term in normalized for term in feedback_terms):
+            return False
+
+        off_topic_terms = {
+            "wear",
+            "outfit",
+            "shirt",
+            "dress",
+            "denim",
+            "jeans",
+            "jacket",
+            "tonight",
+            "dinner",
+            "fashion",
+            "food",
+            "movie",
+            "music",
+            "weather",
+            "joke",
+            "restaurant",
+            "recommend",
+            "your name",
+            "who are you",
+            "how are you",
+            "do you like",
+            "what should i",
+        }
+        return any(term in normalized for term in off_topic_terms)
+
+    def _is_rating_like_message(self, user_input: str) -> bool:
+        normalized = user_input.strip().lower()
+        if any(term in normalized for term in {"/5", "out of 5"}):
+            return True
+        if normalized.split() and normalized.split()[0].strip(".,:-").isdigit():
+            return True
+        rating_terms = {"rate", "rating", "score", "star", "stars"}
+        tokens = {"".join(ch for ch in token if ch.isalnum()) for token in normalized.split()}
+        if tokens & rating_terms:
+            return True
+        split_tokens = normalized.replace("/", " ").split()
+        return len(split_tokens) <= 3 and any(token.strip(".,!?").isdigit() for token in split_tokens)
+
     def _is_vague_acknowledgement(self, user_input: str) -> bool:
         normalized = user_input.strip().lower().strip(".! ")
         return normalized in {
@@ -979,14 +1153,14 @@ class ChatService:
         count = self._increment_off_track_count(conversation)
         if count >= 2:
             conversation.state = ConversationState.END
-            return "Understood. I will pause this feedback for now. Let me know if you would like to add anything later."
+            return "It looks like we have moved away from the feedback discussion, so I will pause this feedback session for now. Feel free to come back anytime if you would like to add more feedback."
 
         if question:
-            return "My name is HeuriSense. I am here to help collect feedback about your AI experience."
+            return "My name is HeuriSense. Right now I am here to collect feedback about your experience with the generated result. Is there anything else you would like to highlight about the output?"
 
         if self._has_feedback_context(conversation):
             return "Noted. If there is anything else you would like to improve or highlight about the output, feel free to mention it."
-        return "I can add feedback about the AI experience whenever you are ready."
+        return "I am mainly here to collect feedback about your experience with the generated result. Is there anything about the output you would like to highlight?"
 
     def _increment_off_track_count(self, conversation: Conversation) -> int:
         context = self._conversation_context(conversation)
@@ -1085,6 +1259,16 @@ class ChatService:
             "material_quality": {"material", "materials", "metallic", "metal", "texture"},
             "distorted_proportions": {"proportion", "proportions", "distorted", "warped"},
             "product_rendering_quality": {"product quality", "rendering quality", "luxury product", "advertisement"},
+            "subject_mismatch": {"subject", "main subject", "not what i asked", "not what i asked for", "did not match", "does not match"},
+            "character_mismatch": {"person", "character", "man", "woman", "did not match", "description"},
+            "identity_mismatch": {"identity", "japanese", "person did not match", "wrong person"},
+            "age_mismatch": {"elderly", "old", "young", "age", "aged"},
+            "attribute_mismatch": {"description", "attribute", "attributes", "did not match"},
+            "prompt_adherence": {"prompt", "instruction", "instructions", "followed", "ignored", "requested", "asked for"},
+            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
+            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements"},
+            "instruction_following": {"instruction", "instructions", "followed", "ignored", "requested", "asked for"},
+            "object_count_errors": {"object count", "count", "three monitors", "two monitors", "too few", "too many"},
             "environmental_scale": {"scale", "environmental scale", "island scale", "terrain"},
             "aerial_perspective": {"aerial", "drone", "perspective", "drone photography"},
             "water_texture_realism": {"water texture", "water textures", "ocean texture", "water"},
@@ -1099,6 +1283,147 @@ class ChatService:
             if any(token in normalized for token in tokens):
                 terms.append(label)
         return terms
+
+    def _current_classification_evidence(
+        self,
+        conversation: Conversation,
+        user_input: str,
+        extracted: FeedbackExtraction,
+    ) -> str:
+        return " ".join(
+            [
+                conversation.prompt or "",
+                user_input,
+                *extracted.positives,
+                *extracted.negatives,
+                *extracted.suggestions,
+            ]
+        ).lower()
+
+    def _issue_tag_supported_by_current_evidence(self, tag: str, evidence_text: str) -> bool:
+        support = {
+            "subject_mismatch": {"subject", "main subject", "not what i asked", "not what i asked for", "did not match", "does not match"},
+            "character_mismatch": {"person", "character", "man", "woman", "did not match", "description"},
+            "identity_mismatch": {"identity", "japanese", "wrong person", "person did not match"},
+            "age_mismatch": {"elderly", "old", "young", "age", "aged"},
+            "attribute_mismatch": {"description", "attribute", "attributes", "did not match"},
+            "prompt_adherence": {"prompt", "asked for", "requested", "instruction", "instructions", "ignored", "missed", "did not match"},
+            "instruction_following": {"instruction", "instructions", "prompt", "asked for", "requested", "ignored", "followed", "did not match"},
+            "prompt_alignment": {"prompt", "missed prompt", "did not follow", "didn't follow", "ignored", "did not match"},
+            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
+            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements", "object", "objects"},
+            "object_count_errors": {"object count", "count", "three monitors", "two monitors", "too few", "too many"},
+            "text_rendering": {"text", "unreadable", "illegible", "read", "font", "type", "typography"},
+            "typography_fidelity": {"text", "font", "type", "typography", "unreadable", "illegible"},
+            "readability": {"read", "readable", "unreadable", "illegible", "text", "label"},
+            "information_accuracy": {"incorrect", "inaccurate", "wrong", "label", "labels", "content", "data"},
+            "label_fidelity": {"label", "labels", "caption", "annotation", "mislabeled", "mislabelled"},
+            "content_correctness": {"incorrect", "inaccurate", "wrong", "content", "label", "labels"},
+            "data_visualization_quality": {"chart", "charts", "graph", "graphs", "axis", "axes", "legend", "plot", "data"},
+            "chart_readability": {"chart", "charts", "graph", "graphs", "axis", "axes", "legend", "plot"},
+            "branding_fidelity": {"logo", "brand", "branding", "wordmark"},
+            "logo_accuracy": {"logo", "brand", "branding", "wordmark"},
+            "environmental_density": {"empty", "density", "crowd", "crowds", "busy", "alive", "activity", "drones", "traffic"},
+            "environmental_realism": {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable", "unrealistic", "not realistic", "fake"},
+            "motion_realism": {"motion", "movement", "moving", "static", "frozen", "action"},
+            "lighting_consistency": {"lighting", "light", "shadow", "falloff", "glow", "neon"},
+            "texture_realism": {"texture", "surface", "grain"},
+            "material_realism": {"material", "metal", "metallic", "fabric", "skin", "plastic"},
+            "reflection_realism": {"reflection", "reflections", "reflective", "mirror"},
+            "scale_consistency": {"scale", "massive", "size", "proportion", "proportions"},
+            "atmospheric_depth": {"depth", "atmospheric", "haze", "distance", "falloff"},
+            "interaction_realism": {"interaction", "integrated", "integration", "natural behavior", "unnatural"},
+            "composition_balance": {"composition", "framing", "balance", "layout"},
+            "perspective_consistency": {"perspective", "aerial", "angle", "vanishing"},
+            "anatomy_accuracy": {"anatomy", "body", "limb", "face", "hand", "pose"},
+            "cinematic_alignment": {"cinematic", "film", "mood", "atmosphere", "cyberpunk", "neon", "visual style", "style"},
+            "detail_sharpness": {"sharp", "sharpness", "blurry", "detail", "details"},
+            "other": set(),
+        }
+        allowed = support.get(tag)
+        if allowed is None:
+            return False
+        if tag == "other":
+            return True
+        return any(self._evidence_contains(evidence_text, token) for token in allowed)
+
+    @staticmethod
+    def _evidence_contains(evidence_text: str, token: str) -> bool:
+        if " " in token or "-" in token:
+            return token in evidence_text
+        return bool(re.search(rf"\b{re.escape(token)}\b", evidence_text))
+
+    def _issue_term_supported_by_current_evidence(self, term: str, evidence_text: str) -> bool:
+        term_to_tag = {
+            "subject_mismatch": "subject_mismatch",
+            "character_mismatch": "character_mismatch",
+            "identity_mismatch": "identity_mismatch",
+            "age_mismatch": "age_mismatch",
+            "attribute_mismatch": "attribute_mismatch",
+            "prompt_adherence": "prompt_adherence",
+            "instruction_following": "instruction_following",
+            "missing_objects": "missing_objects",
+            "missing_elements": "missing_elements",
+            "object_count_errors": "object_count_errors",
+            "text_rendering": "text_rendering",
+            "typography_fidelity": "typography_fidelity",
+            "readability": "readability",
+            "data_visualization_quality": "data_visualization_quality",
+            "chart_readability": "chart_readability",
+            "environmental_scale": "scale_consistency",
+            "aerial_perspective": "perspective_consistency",
+            "lighting_mood": "lighting_consistency",
+            "style_mismatch": "cinematic_alignment",
+            "image_sharpness": "detail_sharpness",
+            "material_quality": "material_realism",
+            "missing_reflections": "reflection_realism",
+            "distorted_proportions": "scale_consistency",
+            "natural_human_feeling": "anatomy_accuracy",
+            "artificial_posing": "anatomy_accuracy",
+        }
+        tag = term_to_tag.get(term)
+        if not tag:
+            return False
+        return self._issue_tag_supported_by_current_evidence(tag, evidence_text)
+
+    def _issue_dimension_supported_by_current_evidence(self, dimension: str, evidence_text: str) -> bool:
+        dimension_to_tags = {
+            "subject mismatch": ["subject_mismatch"],
+            "character mismatch": ["character_mismatch"],
+            "identity mismatch": ["identity_mismatch"],
+            "age mismatch": ["age_mismatch"],
+            "attribute mismatch": ["attribute_mismatch"],
+            "prompt adherence": ["prompt_adherence", "prompt_alignment"],
+            "instruction following": ["instruction_following"],
+            "missing objects": ["missing_objects", "missing_elements"],
+            "object count errors": ["object_count_errors"],
+            "text readability": ["text_rendering", "readability", "typography_fidelity"],
+            "label accuracy": ["label_fidelity", "information_accuracy", "content_correctness"],
+            "chart readability": ["chart_readability", "data_visualization_quality"],
+            "branding fidelity": ["branding_fidelity", "logo_accuracy"],
+            "scale consistency": ["scale_consistency"],
+            "underwater depth cues": ["atmospheric_depth"],
+            "lighting falloff": ["lighting_consistency"],
+            "lighting consistency": ["lighting_consistency"],
+            "environmental integration": ["interaction_realism", "environmental_realism"],
+            "environmental realism": ["environmental_realism"],
+            "material behavior": ["material_realism"],
+            "texture consistency": ["texture_realism"],
+            "motion and body dynamics": ["motion_realism"],
+            "body dynamics": ["anatomy_accuracy"],
+            "tone consistency": ["cinematic_alignment"],
+            "style alignment": ["cinematic_alignment"],
+            "detail sharpness": ["detail_sharpness"],
+            "material finish": ["material_realism", "reflection_realism"],
+            "environmental believability": ["environmental_realism", "environmental_believability"],
+            "technical realism": ["detail_sharpness", "material_realism", "reflection_realism", "scale_consistency"],
+            "natural posing": ["anatomy_accuracy"],
+            "other": ["other"],
+        }
+        tags = dimension_to_tags.get(dimension)
+        if not tags:
+            return False
+        return any(self._issue_tag_supported_by_current_evidence(tag, evidence_text) for tag in tags)
 
     def _mark_thread_completed(self, conversation: Conversation, active_thread: str) -> None:
         context = self._conversation_context(conversation)
@@ -1241,6 +1566,17 @@ class ChatService:
             "anatomy_accuracy": "anatomy accuracy",
             "cinematic_alignment": "cinematic alignment",
             "prompt_alignment": "prompt alignment",
+            "prompt_adherence": "prompt adherence",
+            "subject_mismatch": "subject mismatch",
+            "character_mismatch": "character mismatch",
+            "identity_mismatch": "identity mismatch",
+            "age_mismatch": "age mismatch",
+            "attribute_mismatch": "attribute mismatch",
+            "missing_objects": "missing objects",
+            "missing_elements": "missing elements",
+            "instruction_following": "instruction following",
+            "object_count_errors": "object count errors",
+            "other": "other",
             "detail_sharpness": "detail sharpness",
             "environmental_believability": "environmental believability",
         }
@@ -1680,8 +2016,19 @@ class ChatService:
             "sharpness",
             "finish",
         }
-        if any(token in phrase for token in realism_dimensions) or issue_type == "quality":
+        content_dimensions = {"text", "label", "chart", "branding", "content", "typography", "readability"}
+        adherence_dimensions = {"prompt", "missing", "instruction", "object", "element"}
+        mismatch_dimensions = {"subject", "character", "identity", "age", "attribute"}
+        if any(token in phrase for token in mismatch_dimensions):
+            return f"I see - the feedback points mostly to {phrase}."
+        if any(token in phrase for token in adherence_dimensions):
+            return f"I see - the feedback points mostly to {phrase}."
+        if any(token in phrase for token in content_dimensions):
+            return f"I see - the feedback points mostly to {phrase}."
+        if any(token in phrase for token in realism_dimensions):
             return f"I see - the realism mainly breaks in {phrase}."
+        if issue_type == "quality":
+            return f"I see - the quality issue is mainly around {phrase}."
         if issue_type == "technical":
             return f"I see - the main problem is {phrase}."
         return f"I see - the feedback points mostly to {phrase}."
@@ -1701,11 +2048,19 @@ class ChatService:
         extracted: FeedbackExtraction,
         issue_type: str,
     ) -> list[str]:
+        textual_evidence = " ".join([user_input, *extracted.negatives, *extracted.suggestions]).lower()
+        current_evidence = self._current_classification_evidence(conversation, user_input, extracted)
         normalized = " ".join(
             [user_input, *extracted.negatives, *extracted.suggestions, *extracted.issue_tags]
         ).lower()
         memory = self._conversation_context(conversation).get("feedback_memory", {})
-        evidence = set(memory.get("thread_evidence", [])) | set(self._extract_issue_terms(user_input, extracted))
+        current_terms = set(self._extract_issue_terms(user_input, extracted))
+        memory_terms = {
+            term
+            for term in set(memory.get("thread_evidence", []))
+            if self._issue_term_supported_by_current_evidence(term, current_evidence)
+        }
+        evidence = current_terms | memory_terms
 
         dimensions: list[str] = []
 
@@ -1717,6 +2072,32 @@ class ChatService:
 
         if any(token in normalized for token in {"scale", "massive", "huge", "size", "proportion", "proportions"}):
             add("scale consistency")
+        if any(token in textual_evidence for token in {"unreadable", "illegible", "hard to read", "could not read", "can't read", "text", "font", "typography"}):
+            add("text readability")
+        if any(token in textual_evidence for token in {"label", "labels", "caption", "captions", "annotation", "annotations"}):
+            add("label accuracy")
+        if any(token in textual_evidence for token in {"chart", "charts", "graph", "graphs", "axis", "axes", "legend", "plot"}):
+            add("chart readability")
+        if any(token in textual_evidence for token in {"logo", "brand", "branding", "wordmark"}):
+            add("branding fidelity")
+        if any(token in textual_evidence for token in {"subject", "main subject", "not what i asked", "not what i asked for", "did not match", "does not match"}):
+            add("subject mismatch")
+        if any(token in textual_evidence for token in {"person", "character"}) and any(token in textual_evidence for token in {"did not match", "does not match", "wrong"}):
+            add("character mismatch")
+        if "elderly" in current_evidence and any(token in textual_evidence for token in {"person did not match", "did not match", "wrong person", "not what i asked"}):
+            add("age mismatch")
+        if any(token in textual_evidence for token in {"description", "attribute", "attributes", "did not match", "does not match"}):
+            add("attribute mismatch")
+        if any(token in textual_evidence for token in {"missing", "missed", "ignored", "left out", "omitted"}):
+            if any(token in textual_evidence for token in {"object", "objects", "element", "elements", "monitor", "monitors", "headphones", "sticky notes", "desk plant"}):
+                add("missing objects")
+            add("prompt adherence")
+            add("instruction following")
+        if "should have contained" in textual_evidence or "should have included" in textual_evidence:
+            add("prompt adherence")
+            add("missing objects")
+        if any(token in textual_evidence for token in {"object count", "too few", "too many", "three monitors", "two monitors"}):
+            add("object count errors")
         if any(token in normalized for token in {"depth", "depth cues", "underwater depth", "underwater"}):
             add("underwater depth cues")
         if any(token in normalized for token in {"falloff", "fall off", "lighting falloff", "light falloff"}):
@@ -1748,17 +2129,50 @@ class ChatService:
             add("environmental believability")
         if {"image_sharpness", "missing_reflections", "material_quality", "distorted_proportions"} & evidence:
             add("technical realism")
+        if {"text_rendering", "typography_fidelity", "readability"} & evidence:
+            add("text readability")
+        if {"label_fidelity", "information_accuracy", "content_correctness"} & evidence:
+            add("label accuracy")
+        if {"data_visualization_quality", "chart_readability"} & evidence and any(
+            token in textual_evidence for token in {"chart", "charts", "graph", "graphs", "axis", "axes", "legend", "plot"}
+        ):
+            add("chart readability")
+        if {"branding_fidelity", "logo_accuracy"} & evidence:
+            add("branding fidelity")
+        if {"subject_mismatch"} & evidence:
+            add("subject mismatch")
+        if {"character_mismatch"} & evidence:
+            add("character mismatch")
+        if {"identity_mismatch"} & evidence:
+            add("identity mismatch")
+        if {"age_mismatch"} & evidence:
+            add("age mismatch")
+        if {"attribute_mismatch"} & evidence:
+            add("attribute mismatch")
+        if {"prompt_adherence"} & evidence:
+            add("prompt adherence")
+        if {"missing_objects", "missing_elements"} & evidence:
+            add("missing objects")
+        if {"instruction_following"} & evidence:
+            add("instruction following")
+        if {"object_count_errors"} & evidence:
+            add("object count errors")
         if {"cinematic_atmosphere", "emotional_flatness"} & evidence:
             add("tone consistency")
-        if {"artificial_posing", "natural_human_feeling"} & evidence:
+        if {"artificial_posing", "natural_human_feeling"} & evidence and any(
+            token in textual_evidence for token in {"pose", "posing", "human", "body", "staged"}
+        ):
             add("natural posing")
 
-        if not dimensions and issue_type == "quality":
-            add("output quality")
-        elif not dimensions and issue_type == "usability":
-            add("usability clarity")
+        filtered = [
+            dimension
+            for dimension in dimensions
+            if self._issue_dimension_supported_by_current_evidence(dimension, current_evidence)
+        ]
+        if not filtered:
+            filtered = ["other"]
 
-        return dimensions[:4]
+        return filtered[:4]
 
     def _combine_issue_summary_with_reply(self, issue_summary: str, base_reply: str) -> str:
         if not issue_summary or issue_summary.lower() in base_reply.lower():
@@ -1982,16 +2396,27 @@ class ChatService:
         conversation.prompt = (prompt or conversation.prompt or "").strip()
         conversation.ai_output = (ai_output or conversation.ai_output or "").strip()
         conversation.ai_output_file_url = (ai_output_file_url or conversation.ai_output_file_url or "").strip() or None
-        self._set_context_value(conversation, "metadata_locked", True)
+        if self._has_required_feedback_inputs(conversation):
+            self._set_context_value(conversation, "metadata_locked", True)
 
     def _metadata_locked(self, conversation: Conversation) -> bool:
-        return bool(
-            self._get_context_value(conversation, "metadata_locked", False)
-            or conversation.task_type
-            or conversation.prompt
-            or conversation.ai_output
-            or conversation.ai_output_file_url
-        )
+        return bool(self._get_context_value(conversation, "metadata_locked", False))
+
+    def _has_required_feedback_inputs(self, conversation: Conversation) -> bool:
+        has_prompt = bool((conversation.prompt or "").strip())
+        has_output = bool((conversation.ai_output or "").strip() or (conversation.ai_output_file_url or "").strip())
+        return has_prompt and has_output
+
+    def _build_waiting_for_inputs_response(self, conversation: Conversation) -> str:
+        missing: list[str] = []
+        if not (conversation.prompt or "").strip():
+            missing.append("the original prompt")
+        if not ((conversation.ai_output or "").strip() or (conversation.ai_output_file_url or "").strip()):
+            missing.append("the AI-generated output or file")
+
+        if len(missing) == 2:
+            return "Please add the original prompt and the AI-generated output or file before we start feedback."
+        return f"Please add {missing[0]} before we start feedback."
 
     def _respond(self, conversation: Conversation, content: str) -> str:
         self._add_assistant_message(conversation, content)

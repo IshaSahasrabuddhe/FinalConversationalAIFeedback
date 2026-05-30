@@ -17,6 +17,7 @@ Rules:
 - If the message contains both feedback and rating, prefer intent="feedback".
 - Pure praise is feedback with positive sentiment and issue_type="none" unless it also includes a problem or requested improvement.
 - Treat emotional mismatch, missing vibe, warmth, mood, tone, realism, or atmosphere as feedback.
+- Treat unrelated questions, casual chat, jokes, restaurant/fashion/lifestyle questions, or assistant identity questions as off_topic.
 - Choose issue_type="technical" for crashes, freezing, delays, failed actions, or broken behavior.
 - Choose issue_type="usability" for confusing flows, difficult UI, unclear steps, navigation problems, or hard-to-use interactions.
 - Choose issue_type="quality" for unrealistic, inaccurate, low-quality, incomplete, irrelevant, incorrect output, or missed emotional tone.
@@ -43,7 +44,10 @@ Support formats like:
 - "3"
 - "I would rate it 3"
 - "2/5"
+- "2 because it ignored several objects"
+- "4 - image quality was good but text was hard to read"
 
+Extract a valid 1-5 rating even when the user adds explanation in the same message.
 If the answer is vague, such as "it's okay", "fine", or "not bad", set is_vague=true.
 When vague, do not guess a score. Ask for clarification in one short sentence that reminds the user of the 1-5 scale.
 If the message is clearly a stop/closure message such as "no", "stop", or "that's it", do not treat it as a rating.
@@ -82,12 +86,20 @@ Extraction rules:
 - Split mixed statements carefully. Text before "but/however/though" may be positive while text after it may be negative.
 - positives: only things the user explicitly liked, praised, or said worked.
 - negatives: concrete failures, missing qualities, realism gaps, or weak areas.
-- suggestions: explicit or implied requested improvements such as "more moving crowds", "better reflections", or "stronger lighting falloff".
+- suggestions: only proposed improvements to the model, system, workflow, or generation process.
+- Do not mark observations like "the workspace should have contained three monitors" as suggestions; capture them as negatives/prompt adherence issues.
 - Never put missing/needed improvements in positives.
 - Treat "wanted", "missed the vibe", "not warm/cozy", "felt flat", and similar emotional/tone gaps as negatives or suggestions even when phrased softly.
 - issue_tags must be 3 to 5 snake_case tags, specific, reusable, and non-duplicated.
 - issue_tags should describe root issues or requested changes, not emotions.
 - Tags must align with negatives and suggestions.
+- Tags must be grounded only in the current feedback text. Never infer realism, posing, anatomy, environment, or motion unless the user actually mentions that evidence.
+- For unreadable text use text_rendering, typography_fidelity, readability.
+- For incorrect labels use label_fidelity, information_accuracy, content_correctness.
+- For bad charts use data_visualization_quality, chart_readability.
+- For bad logos or branding use branding_fidelity, logo_accuracy.
+- For missed requested objects use prompt_adherence, missing_objects, instruction_following.
+- If confidence is low, use other rather than forcing realism, environment, anatomy, or posing categories.
 - Prefer concrete tags such as environmental_density, environmental_realism, lighting_consistency, motion_realism, texture_realism, scale_consistency, atmospheric_depth, material_realism, reflection_realism, interaction_realism, composition_balance, perspective_consistency, anatomy_accuracy, cinematic_alignment, prompt_alignment, detail_sharpness.
 - Avoid vague tags such as realism_issue, visual_quality, quality_problem, lack_of_realism, technical_product_realism, environmental_aerial_realism.
 
@@ -125,6 +137,13 @@ Rules:
 - Avoid duplicates
 - Focus on root issue or requested behavior
 - Prefer concrete issue dimensions over broad labels.
+- Use only categories supported by the current feedback text. Do not inject common image categories from other sessions.
+- For unreadable text use text_rendering, typography_fidelity, readability.
+- For incorrect labels use label_fidelity, information_accuracy, content_correctness.
+- For bad charts use data_visualization_quality, chart_readability.
+- For bad logos or branding use branding_fidelity, logo_accuracy.
+- For missed requested objects use prompt_adherence, missing_objects, instruction_following.
+- If confidence is low, use other rather than forcing previous or common categories.
 - Good tags include environmental_density, environmental_realism, lighting_consistency, motion_realism, texture_realism, scale_consistency, atmospheric_depth, material_realism, reflection_realism, interaction_realism, composition_balance, perspective_consistency, anatomy_accuracy, cinematic_alignment, prompt_alignment, detail_sharpness.
 - Avoid vague tags such as realism_issue, visual_quality, quality_problem, lack_of_realism, technical_product_realism, environmental_aerial_realism.
 
