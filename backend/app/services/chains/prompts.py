@@ -208,3 +208,66 @@ Collected negatives: {negatives}
 Collected suggestions: {suggestions}
 Collected issue_tags: {issue_tags}
 """
+
+INTENT_LABEL_PROMPT = """
+Extract the user's primary creation intent from the prompt.
+Return strict JSON only:
+{{
+  "intent_label": "...",
+  "confidence": 0.0
+}}
+
+Context:
+- task_type: {task_type}
+- prompt: {prompt}
+
+Rules:
+- Maximum 2 to 6 words.
+- Use natural vocabulary.
+- Focus on the main subject or asset being generated.
+- Extract the primary subject, scene, environment, or object even for unseen categories.
+- Paraphrase when helpful.
+- Do not copy full prompt fragments.
+- Ignore secondary instructions, mood notes, camera directions, background details, and quality requirements.
+- Ignore quality adjectives such as realistic, highly detailed, photorealistic, and minimalist unless essential to the subject.
+- Do not include verbs like create, generate, make, write, produce, or design.
+- Do not include trailing incomplete phrases.
+- Set confidence from 0 to 1. Use >=0.75 for clear prompts.
+
+Examples:
+- "Create a realistic wedding photograph featuring a bride and groom at sunset." -> "wedding photograph"
+- "Create a realistic medieval castle on a misty hill at sunrise." -> "medieval castle scene"
+- "Create a realistic portrait of an elderly Japanese potter." -> "portrait of a pottery artisan"
+- "Create a workspace setup for a software engineer." -> "professional workspace image"
+- "Create a minimalist Scandinavian living room." -> "Scandinavian living room"
+- "Create a highly detailed fantasy world map." -> "fantasy world map"
+- "Create a realistic underwater wildlife photograph of a giant whale." -> "underwater whale photograph"
+- "Create a cyberpunk street market at night." -> "cyberpunk street market"
+- "Create a Victorian library filled with ancient books." -> "Victorian library"
+- "Create a futuristic lunar research station." -> "lunar research station"
+"""
+
+INTENT_LABEL_REFINEMENT_PROMPT = """
+Refine a raw intent label into a short natural English phrase.
+Return strict JSON only:
+{{
+  "refined_label": "..."
+}}
+
+Input:
+- raw_label: {raw_label}
+
+Rules:
+- Keep only the primary subject, scene, environment, or object.
+- Remove trailing prompt fragments such as showing, containing, displayed, featuring, with, including.
+- Prefer the subject over the environment when both are present.
+- Keep 2 to 6 words when possible.
+- Do not add instruction text.
+- Do not return a sentence.
+
+Examples:
+- "fantasy world map showing kingdoms forests" -> "fantasy world map"
+- "conference presentation slide displayed" -> "conference presentation slide"
+- "underwater ocean photograph" -> "marine wildlife photograph"
+- "castle image realistic sunrise atmospheric" -> "castle scene"
+"""

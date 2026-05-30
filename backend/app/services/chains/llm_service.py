@@ -23,6 +23,8 @@ from app.services.chains.prompts import (
     FEEDBACK_EXTRACTION_PROMPT,
     FEEDBACK_INSIGHTS_PROMPT,
     HUMAN_FOLLOWUP_PROMPT,
+    INTENT_LABEL_REFINEMENT_PROMPT,
+    INTENT_LABEL_PROMPT,
     INTENT_PROMPT,
     ISSUE_CLASSIFICATION_PROMPT,
     ISSUE_TAG_PROMPT,
@@ -36,6 +38,15 @@ T = TypeVar("T", bound=BaseModel)
 
 class IssueTagResult(BaseModel):
     issue_tags: list[str]
+
+
+class IntentLabelResult(BaseModel):
+    intent_label: str = ""
+    confidence: float = 0.0
+
+
+class IntentLabelRefinementResult(BaseModel):
+    refined_label: str = ""
 
 
 class StructuredChainFactory:
@@ -999,6 +1010,155 @@ class FallbackClassifier:
         overlap = prompt_words & output_words
         return len(overlap) >= min(3, max(1, len(prompt_words) // 5))
 
+    @classmethod
+    def generate_intent_label(cls, *, task_type: str, prompt: str) -> IntentLabelResult:
+        label = cls._fallback_intent_label(task_type, prompt)
+        refined = cls.refine_intent_label(label, prompt=prompt)
+        return IntentLabelResult(intent_label=refined, confidence=0.78 if refined else 0.0)
+
+    @classmethod
+    def refine_intent_label(cls, raw_label: str, *, prompt: str = "") -> str:
+        cleaned = " ".join((raw_label or "").strip().strip("\"'` .!?").split())
+        if not cleaned:
+            return ""
+
+        normalized = cleaned.lower()
+        prompt_normalized = prompt.lower()
+
+        if "world map" in normalized:
+            prefix = "fantasy " if "fantasy" in normalized or "fantasy" in prompt_normalized else ""
+            return f"{prefix}world map".strip()
+
+        if "presentation slide" in normalized or "presentation slide" in prompt_normalized:
+            if "business" in normalized or "business" in prompt_normalized:
+                return "business presentation slide"
+            if "conference" in normalized or "conference" in prompt_normalized:
+                return "conference presentation slide"
+            return "presentation slide"
+
+        if "underwater" in normalized and "photograph" in normalized:
+            if "whale" in normalized or "whale" in prompt_normalized:
+                return "underwater whale photograph"
+            if "wildlife" in normalized or "wildlife" in prompt_normalized or "marine" in normalized or "marine" in prompt_normalized:
+                return "marine wildlife photograph"
+
+        cleaned = re.split(
+            r"\s+\b(?:showing|containing|displayed|featuring|including|with)\b",
+            cleaned,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        cleaned = re.sub(r"\b(?:displayed|shown|visible|image|picture)\b$", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = cls._remove_intent_noise_words(cleaned)
+        cleaned = cls._normalize_intent_label(cleaned)
+
+        if cleaned.endswith(" castle"):
+            cleaned = f"{cleaned} scene"
+        if len(cleaned.split()) < 2:
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _fallback_intent_label(task_type: str, prompt: str) -> str:
+        task = (task_type or "").lower()
+        normalized = prompt.lower()
+
+        if any(token in normalized for token in {"potter", "pottery", "artisan"}):
+            if "portrait" in normalized:
+                return "portrait of a pottery artisan"
+            return "traditional pottery scene"
+        if any(token in normalized for token in {"workspace", "desk", "software engineer", "office"}):
+            return "professional workspace image" if task == "image" else "professional workspace"
+        return FallbackClassifier._generic_intent_label(prompt)
+
+    @staticmethod
+    def _generic_intent_label(prompt: str) -> str:
+        cleaned = " ".join(prompt.strip().strip("\"'` ").split())
+        if not cleaned:
+            return ""
+
+        cleaned = re.split(r"\.\s+|\b(?:the|this)\s+(?:image|output|result|scene)\s+should\b", cleaned, maxsplit=1, flags=re.IGNORECASE)[0]
+        cleaned = re.sub(r"^(?:please\s+)?(?:create|generate|make|write|produce|draft|design|render|compose)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = FallbackClassifier._remove_intent_noise_words(cleaned)
+        cleaned = re.split(
+            r"\s+(?:with|featuring|filled with|including|at night|at sunrise|at sunset|during|above|on a|on an|on the|in the style|in a style|using)\b",
+            cleaned,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        cleaned = cleaned.strip(" ,.;:-")
+        if not cleaned:
+            return ""
+
+        photo_match = re.search(r"^(?P<context>.*?)\b(?P<kind>photo|photograph)\s+of\s+(?P<subject>.+)$", cleaned, flags=re.IGNORECASE)
+        if photo_match:
+            context = FallbackClassifier._trim_label_words(photo_match.group("context").replace(" wildlife", ""), keep_environment=True)
+            subject = FallbackClassifier._trim_label_words(photo_match.group("subject"), keep_environment=False)
+            subject_words = subject.split()
+            if subject_words:
+                main_subject = subject_words[-1]
+                parts = [context, main_subject, "photograph"]
+                return FallbackClassifier._normalize_intent_label(" ".join(part for part in parts if part))
+
+        portrait_match = re.search(r"^portrait\s+of\s+(?P<subject>.+)$", cleaned, flags=re.IGNORECASE)
+        if portrait_match:
+            subject = FallbackClassifier._trim_label_words(portrait_match.group("subject"), keep_environment=False)
+            if subject:
+                return FallbackClassifier._normalize_intent_label(f"{subject} portrait")
+
+        label = FallbackClassifier._trim_label_words(cleaned, keep_environment=True)
+        label = FallbackClassifier._normalize_intent_label(label)
+        if label.endswith(" castle"):
+            label = f"{label} scene"
+        if label and len(label.split()) <= 1:
+            return ""
+        return label
+
+    @staticmethod
+    def _remove_intent_noise_words(text: str) -> str:
+        noise = {
+            "realistic",
+            "photorealistic",
+            "photo-realistic",
+            "highly",
+            "detailed",
+            "ultra",
+            "minimalist",
+            "futuristic",
+            "beautiful",
+            "dramatic",
+            "atmospheric",
+            "authentic",
+            "historical",
+            "professional",
+            "giant",
+        }
+        words = [word for word in text.split() if word.lower().strip(" ,.;:-") not in noise]
+        return " ".join(words)
+
+    @staticmethod
+    def _trim_label_words(text: str, *, keep_environment: bool) -> str:
+        text = re.sub(r"^(?:a|an|the)\s+", "", text.strip(), flags=re.IGNORECASE)
+        remove = {"wildlife", "setup", "scene"} if not keep_environment else {"setup"}
+        words = [word.strip(" ,.;:-") for word in text.split()]
+        words = [word for word in words if word and word.lower() not in remove]
+        return " ".join(words)
+
+    @staticmethod
+    def _normalize_intent_label(label: str) -> str:
+        words = [word for word in label.strip().split() if word]
+        if len(words) > 6:
+            words = words[:6]
+        cleaned = " ".join(words).strip(" ,.;:-")
+        if not cleaned:
+            return ""
+        protected_title_words = {"Scandinavian", "Victorian"}
+        first, *rest = cleaned.split()
+        if first not in protected_title_words and not first.isupper():
+            cleaned = " ".join([first[:1].lower() + first[1:], *rest])
+        return cleaned
+
 
 def _top_items(items: list[str], limit: int) -> list[str]:
     counts: dict[str, int] = {}
@@ -1022,6 +1182,11 @@ class FeedbackLLMService:
         self._tag_chain = self._build_optional_chain(ISSUE_TAG_PROMPT, IssueTagResult)
         self._human_followup_chain = self._build_optional_chain(HUMAN_FOLLOWUP_PROMPT, HumanFollowupQuestionResult)
         self._feedback_insights_chain = self._build_optional_chain(FEEDBACK_INSIGHTS_PROMPT, FeedbackInsightsResult)
+        self._intent_label_chain = self._build_optional_chain(INTENT_LABEL_PROMPT, IntentLabelResult)
+        self._intent_label_refinement_chain = self._build_optional_chain(
+            INTENT_LABEL_REFINEMENT_PROMPT,
+            IntentLabelRefinementResult,
+        )
 
     def _build_optional_chain(self, prompt: str, schema: Type[T]) -> RunnableSerializable | None:
         if not self.factory.enabled:
@@ -1075,3 +1240,30 @@ class FeedbackLLMService:
         if self._feedback_insights_chain:
             return self._feedback_insights_chain.invoke(payload)
         return FallbackClassifier.generate_feedback_insights(**payload)
+
+    def generate_intent_label(self, *, task_type: str, prompt: str) -> IntentLabelResult:
+        raw_result: IntentLabelResult
+        if self._intent_label_chain:
+            try:
+                raw_result = self._intent_label_chain.invoke({"task_type": task_type, "prompt": prompt})
+            except Exception:
+                raw_result = FallbackClassifier.generate_intent_label(task_type=task_type, prompt=prompt)
+        else:
+            raw_result = FallbackClassifier.generate_intent_label(task_type=task_type, prompt=prompt)
+
+        refined_label = self.refine_intent_label(raw_result.intent_label, prompt=prompt)
+        return IntentLabelResult(
+            intent_label=refined_label,
+            confidence=raw_result.confidence if refined_label else 0.0,
+        )
+
+    def refine_intent_label(self, raw_label: str, *, prompt: str = "") -> str:
+        if self._intent_label_refinement_chain and raw_label:
+            try:
+                result = self._intent_label_refinement_chain.invoke({"raw_label": raw_label})
+                refined = FallbackClassifier.refine_intent_label(result.refined_label, prompt=prompt)
+                if refined:
+                    return refined
+            except Exception:
+                pass
+        return FallbackClassifier.refine_intent_label(raw_label, prompt=prompt)

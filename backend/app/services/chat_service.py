@@ -13,7 +13,7 @@ from app.models.message import Message
 from app.models.user import User
 from app.schemas.chat import ConversationMetadata
 from app.schemas.llm import ConversationTurnAnalysis, FeedbackExtraction, RatingExtraction
-from app.services.chains.llm_service import FeedbackLLMService
+from app.services.chains.llm_service import FallbackClassifier, FeedbackLLMService
 
 logger = logging.getLogger(__name__)
 
@@ -150,10 +150,109 @@ class ChatService:
     def _advance_without_user_message(self, conversation: Conversation) -> str:
         if conversation.state == ConversationState.START:
             conversation.state = ConversationState.ASK_FEEDBACK
-            assistant_message = "I would love to hear how the AI experience went. What worked well, and what did not?"
+            assistant_message = self._build_session_opening_message(conversation)
             self._add_assistant_message(conversation, assistant_message)
             return assistant_message
         return "How can I help with your feedback?"
+
+    def _build_session_opening_message(self, conversation: Conversation) -> str:
+        default = "I would love to hear how the AI experience went. What worked well, and what did not?"
+        intro = self._build_context_intro(conversation)
+        if not intro:
+            return default
+        return f"{intro} {default}"
+
+    def _build_context_intro(self, conversation: Conversation) -> str:
+        task_type = (conversation.task_type or "").strip().lower()
+        intent_label = self._extract_opening_intent_label(task_type, conversation.prompt or "")
+        if intent_label:
+            return f"I see you were creating {self._with_article(intent_label)}."
+        return self._generic_context_intro(task_type)
+
+    def _extract_opening_intent_label(self, task_type: str, prompt: str) -> str:
+        if not prompt.strip():
+            logger.debug(
+                "intent_label_opening prompt=%r groq_label=%r confidence=%.2f validation=%s fallback_triggered=%s fallback_reason=%s",
+                prompt,
+                "",
+                0.0,
+                "fail",
+                True,
+                "missing_prompt",
+            )
+            return ""
+        result = self.llm_service.generate_intent_label(task_type=task_type, prompt=prompt)
+        sanitized = self._sanitize_intent_label(result.intent_label)
+        fallback_label = ""
+        fallback_reason = ""
+
+        if not sanitized:
+            fallback_label = self._fallback_opening_intent_label(task_type, prompt)
+            fallback_reason = "invalid_or_empty_label" if result.intent_label else "groq_unavailable_or_empty_label"
+
+        final_label = sanitized or fallback_label
+        logger.debug(
+            "intent_label_opening prompt=%r groq_label=%r confidence=%.2f validation=%s fallback_triggered=%s fallback_reason=%s",
+            prompt,
+            result.intent_label,
+            getattr(result, "confidence", 0.0) or 0.0,
+            "pass" if sanitized else "fail",
+            bool(fallback_label or not final_label),
+            fallback_reason or "none",
+        )
+        return final_label
+
+    def _sanitize_intent_label(self, label: str) -> str:
+        cleaned = " ".join((label or "").strip().strip("\"'` .!?").split())
+        if not cleaned:
+            return ""
+
+        cleaned = re.sub(r"^(?:create|generate|make|write|produce|draft|design)\s+", "", cleaned, flags=re.IGNORECASE)
+        blocked_fragments = {
+            "should",
+            "background",
+            "blurred",
+            "focus",
+            "quality",
+            "emotional",
+            "instructions",
+            "showing",
+            "containing",
+            "displayed",
+            "featuring",
+            "including",
+        }
+        words = cleaned.split()
+        if not 2 <= len(words) <= 6:
+            return ""
+        if any(fragment in cleaned.lower() for fragment in blocked_fragments):
+            return ""
+        if re.search(r"\bwith\b", cleaned, flags=re.IGNORECASE):
+            return ""
+        if cleaned.endswith((",", ";", ":")):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _fallback_opening_intent_label(task_type: str, prompt: str) -> str:
+        return FallbackClassifier._fallback_intent_label(task_type, prompt)
+
+    def _generic_context_intro(self, task_type: str) -> str:
+        fallbacks = {
+            "image": "I see you were generating an image.",
+            "text": "I see you were generating text.",
+            "audio": "I see you were generating audio.",
+            "video": "I see you were generating a video.",
+            "document": "I see you were generating a document.",
+        }
+        return fallbacks.get(task_type, "")
+
+    @staticmethod
+    def _with_article(label: str) -> str:
+        if label.lower().startswith(("a ", "an ", "the ", "some ")):
+            return label
+        article = "an" if label[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+        return f"{article} {label}"
 
     def _advance_state(self, conversation: Conversation, user_input: str) -> str:
         previous_state = conversation.state
@@ -167,7 +266,7 @@ class ChatService:
             self._log_state("end", conversation, user_input)
             return self._respond(
                 conversation,
-                "Understood. I will pause this feedback for now. Let me know if you would like to add anything later.",
+                self._build_pause_message(),
             )
 
         if self._is_confirmation_signal(user_input) and self._has_feedback_context(conversation):
@@ -1264,7 +1363,7 @@ class ChatService:
         count = self._increment_off_track_count(conversation)
         if count >= 2:
             conversation.state = ConversationState.END
-            return "It looks like we have moved away from the feedback discussion, so I will pause this feedback session for now. Feel free to come back anytime if you would like to add more feedback."
+            return self._build_pause_message()
 
         if question:
             return "My name is HeuriSense. Right now I am here to collect feedback about your experience with the generated result. Is there anything else you would like to highlight about the output?"
@@ -1272,6 +1371,13 @@ class ChatService:
         if self._has_feedback_context(conversation):
             return "Noted. If there is anything else you would like to improve or highlight about the output, feel free to mention it."
         return "I am mainly here to collect feedback about your experience with the generated result. Is there anything about the output you would like to highlight?"
+
+    @staticmethod
+    def _build_pause_message() -> str:
+        return (
+            "Thank you for sharing your feedback. I will pause this feedback session for now. "
+            "Feel free to come back anytime if you would like to add more feedback."
+        )
 
     def _increment_off_track_count(self, conversation: Conversation) -> int:
         context = self._conversation_context(conversation)
