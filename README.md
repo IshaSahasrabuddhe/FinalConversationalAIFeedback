@@ -21,13 +21,17 @@ The application is designed to feel simple on the surface while running a struct
 ## Live Demo
 
 Check out the deployed website here:  
-[Deployed Website Link](https://convofeedback-frontend.onrender.com)  
+[Deployed Website Link](https://finalconversationalaifeedbackfrontend.onrender.com)  
 
 For the best experience, please sign up as a user first and then proceed with the admin login for a smoother transition.  
 If you encounter any issues, please refer to the demo video.
 
 ---
 ## Video Demo
+
+The UI enhancements are part of our next development phase and will be focused on making system navigation more intuitive and user-friendly. For the time being, we have attached the same walkthrough video from the previous version to assist with navigation.
+
+We encourage you to explore the live demo to experience the improved conversation flow and functionality.
 
 Watch the full walkthrough (user flow, admin flow, and dashboard insights):  
  [Watch Demo Video](https://drive.google.com/file/d/13IAQ6ehE-6TlfPXK7_OytNqiypyDSJhu/view?usp=sharing)
