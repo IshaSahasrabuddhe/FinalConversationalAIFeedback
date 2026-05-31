@@ -36,7 +36,7 @@ export default function SignupPage() {
       <div className="relative z-10 flex w-full max-w-[720px] flex-col items-center">
         <div className="mb-10 text-center">
           <h1 className="text-6xl font-semibold leading-normal text-slate-100">
-            Luminescent <span className="text-cyan-300">Insight</span>
+            Heuri<span className="text-cyan-300">Sense</span>
           </h1>
           <p className="mt-3 text-xs font-semibold uppercase leading-normal tracking-[0.28em] text-slate-400">
             AI Feedback Analytics Platform

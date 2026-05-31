@@ -152,6 +152,54 @@ Rules:
 Feedback text: {message}
 """
 
+ISSUE_CATEGORY_CLASSIFICATION_PROMPT = """
+Classify feedback into evidence-supported issue categories.
+Return strict JSON only:
+{{
+  "primary_issues": [
+    {{"category": "...", "confidence": 0.0}}
+  ],
+  "secondary_issues": [
+    {{"category": "...", "confidence": 0.0}}
+  ],
+  "positive_aspects": [
+    {{"category": "...", "confidence": 0.0}}
+  ],
+  "rejected_categories": []
+}}
+
+Input:
+- original_prompt: {prompt}
+- user_feedback: {feedback_text}
+- previous_feedback_context_current_session_only: {session_context}
+
+Rules:
+- Use user_feedback as the strongest evidence.
+- Use original_prompt only to understand what object or requirement was missing or mismatched.
+- Use previous_feedback_context_current_session_only only if it is directly relevant to this same session.
+- Never use categories from other conversations or common image-feedback assumptions.
+- A negative issue may be assigned only when directly mentioned or strongly implied by the feedback.
+- If the user praises a category, place it in positive_aspects and do not also classify it as a negative issue unless the same feedback explicitly criticizes it later.
+- Separate positive aspects from negative issues.
+- Do not infer realism, readability, posing, sharpness, anatomy, lighting, or environment issues unless those concepts are criticized.
+- Missing requested objects or details should map to missing objects and prompt adherence, not detail sharpness.
+- Use short lowercase category names such as "missing objects", "prompt adherence", "text readability", "scale consistency", "realism", "visual appeal".
+- Give each returned category a confidence from 0 to 1.
+- Put unsupported or contradicted categories in rejected_categories.
+
+Examples:
+- feedback: "The puppy looked very realistic and cute but the basket and blanket were missing."
+  positive_aspects: [{{"category":"realism","confidence":0.95}}, {{"category":"visual appeal","confidence":0.85}}]
+  primary_issues: [{{"category":"missing objects","confidence":0.95}}, {{"category":"prompt adherence","confidence":0.9}}]
+  rejected_categories: ["environmental realism"]
+- feedback: "The chart text was unreadable."
+  primary_issues: [{{"category":"text readability","confidence":0.95}}]
+  rejected_categories: ["prompt adherence", "realism", "natural posing"]
+- feedback: "The whale did not feel massive."
+  primary_issues: [{{"category":"scale consistency","confidence":0.9}}]
+  rejected_categories: ["text readability", "environmental realism"]
+"""
+
 HUMAN_FOLLOWUP_PROMPT = """
 You write exactly one short, natural follow-up question for a feedback chat.
 Return strict JSON only:
@@ -210,7 +258,7 @@ Collected issue_tags: {issue_tags}
 """
 
 INTENT_LABEL_PROMPT = """
-Extract the user's primary creation intent from the prompt.
+Infer the user's primary creation intent from the prompt.
 Return strict JSON only:
 {{
   "intent_label": "...",
@@ -222,19 +270,24 @@ Context:
 - prompt: {prompt}
 
 Rules:
-- Maximum 2 to 6 words.
+- Generate a concise human-readable label, ideally 2 to 5 words and maximum 6 words.
 - Use natural vocabulary.
-- Focus on the main subject or asset being generated.
-- Extract the primary subject, scene, environment, or object even for unseen categories.
+- Infer the task purpose, subject, and artifact type.
+- Do not extract the first words of the prompt.
+- For text tasks, identify the communication purpose and artifact type, not the writing instruction.
+- For image tasks, identify the scene, object, subject, or asset being created.
 - Paraphrase when helpful.
 - Do not copy full prompt fragments.
 - Ignore secondary instructions, mood notes, camera directions, background details, and quality requirements.
 - Ignore quality adjectives such as realistic, highly detailed, photorealistic, and minimalist unless essential to the subject.
 - Do not include verbs like create, generate, make, write, produce, or design.
+- Do not end with articles or prepositions such as a, an, the, to, for, with, of, or in.
 - Do not include trailing incomplete phrases.
 - Set confidence from 0 to 1. Use >=0.75 for clear prompts.
 
 Examples:
+- "Write a warm and friendly email to a customer thanking them for being a loyal customer for five years." -> "customer appreciation email"
+- "Write an email thanking a customer for loyalty." -> "loyalty thank-you email"
 - "Create a realistic wedding photograph featuring a bride and groom at sunset." -> "wedding photograph"
 - "Create a realistic medieval castle on a misty hill at sunrise." -> "medieval castle scene"
 - "Create a realistic portrait of an elderly Japanese potter." -> "portrait of a pottery artisan"
@@ -245,6 +298,34 @@ Examples:
 - "Create a cyberpunk street market at night." -> "cyberpunk street market"
 - "Create a Victorian library filled with ancient books." -> "Victorian library"
 - "Create a futuristic lunar research station." -> "lunar research station"
+"""
+
+STRICT_INTENT_LABEL_PROMPT = """
+Rewrite the creation prompt as a short semantic intent label.
+Return strict JSON only:
+{{
+  "intent_label": "...",
+  "confidence": 0.0
+}}
+
+Context:
+- task_type: {task_type}
+- prompt: {prompt}
+
+Rules:
+- Return only the intended artifact, purpose, and subject.
+- 2 to 5 words preferred, 6 words maximum.
+- Never start with or include instruction verbs: create, write, generate, design, make, produce, draft, render, compose.
+- Never copy an unfinished span from the prompt.
+- Never end with a, an, the, to, for, with, of, in, on, near, at, by, or from.
+- Text/email prompts: name the communication purpose, e.g. "customer appreciation email".
+- Image prompts: name the scene/object/asset, e.g. "underwater wildlife photograph".
+
+Examples:
+- "Write a warm and friendly email to a customer thanking them for being a loyal customer for five years." -> "customer appreciation email"
+- "Create a realistic underwater wildlife photograph of a giant whale near a scuba diver." -> "underwater wildlife photograph"
+- "Create a highly detailed fantasy world map." -> "fantasy world map"
+- "Create a realistic conference presentation slide." -> "conference presentation slide"
 """
 
 INTENT_LABEL_REFINEMENT_PROMPT = """
@@ -260,12 +341,15 @@ Input:
 Rules:
 - Keep only the primary subject, scene, environment, or object.
 - Remove trailing prompt fragments such as showing, containing, displayed, featuring, with, including.
+- Remove instruction verbs such as create, write, generate, design, make, produce, draft, render, and compose.
 - Prefer the subject over the environment when both are present.
 - Keep 2 to 6 words when possible.
 - Do not add instruction text.
 - Do not return a sentence.
+- Do not end with articles or prepositions such as a, an, the, to, for, with, of, or in.
 
 Examples:
+- "warm and friendly email to a" -> "customer appreciation email"
 - "fantasy world map showing kingdoms forests" -> "fantasy world map"
 - "conference presentation slide displayed" -> "conference presentation slide"
 - "underwater ocean photograph" -> "marine wildlife photograph"

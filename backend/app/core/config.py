@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./feedback_collector.db"
     groq_api_key: str | None = None
     groq_model: str = "llama-3.3-70b-versatile"
+    issue_category_confidence_threshold: float = 0.7
     frontend_origin: str = "http://localhost:5173"
     admin_email: str = "admin@system.com"
     admin_password: str = "Admin@123"

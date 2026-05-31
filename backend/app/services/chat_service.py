@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 class ChatService:
+    STORAGE_ONLY_DISPLAY_CATEGORIES = {"other", "miscellaneous", "unknown", "uncategorized", "none"}
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.llm_service = FeedbackLLMService()
@@ -170,66 +173,50 @@ class ChatService:
         return self._generic_context_intro(task_type)
 
     def _extract_opening_intent_label(self, task_type: str, prompt: str) -> str:
+        started_at = time.perf_counter()
         if not prompt.strip():
             logger.debug(
-                "intent_label_opening prompt=%r groq_label=%r confidence=%.2f validation=%s fallback_triggered=%s fallback_reason=%s",
+                "intent_label_opening raw_prompt=%r groq_label=%r refined_label=%r validation_result=%s retry_used=%s fallback_used=%s confidence=%.2f",
                 prompt,
                 "",
-                0.0,
-                "fail",
-                True,
+                "",
                 "missing_prompt",
+                False,
+                True,
+                0.0,
             )
+            self._log_response_timing(intent_label_ms=self._elapsed_ms(started_at))
             return ""
         result = self.llm_service.generate_intent_label(task_type=task_type, prompt=prompt)
         sanitized = self._sanitize_intent_label(result.intent_label)
-        fallback_label = ""
-        fallback_reason = ""
 
-        if not sanitized:
-            fallback_label = self._fallback_opening_intent_label(task_type, prompt)
-            fallback_reason = "invalid_or_empty_label" if result.intent_label else "groq_unavailable_or_empty_label"
+        fallback_used = bool(getattr(result, "fallback_used", False))
+        validation_result = getattr(result, "validation_result", "") or ("pass" if sanitized else "invalid_final_label")
+        if result.intent_label and not sanitized:
+            validation_result = "invalid_final_label"
+            fallback_used = True
+            sanitized = self._sanitize_intent_label(self._fallback_opening_intent_label(task_type, prompt))
 
-        final_label = sanitized or fallback_label
         logger.debug(
-            "intent_label_opening prompt=%r groq_label=%r confidence=%.2f validation=%s fallback_triggered=%s fallback_reason=%s",
+            "intent_label_opening raw_prompt=%r groq_label=%r refined_label=%r validation_result=%s retry_used=%s fallback_used=%s confidence=%.2f",
             prompt,
-            result.intent_label,
+            getattr(result, "groq_label", "") or "",
+            sanitized or getattr(result, "refined_label", "") or "",
+            validation_result,
+            bool(getattr(result, "retry_used", False)),
+            fallback_used or not bool(sanitized),
             getattr(result, "confidence", 0.0) or 0.0,
-            "pass" if sanitized else "fail",
-            bool(fallback_label or not final_label),
-            fallback_reason or "none",
         )
-        return final_label
+        self._log_response_timing(intent_label_ms=self._elapsed_ms(started_at))
+        return sanitized
 
     def _sanitize_intent_label(self, label: str) -> str:
         cleaned = " ".join((label or "").strip().strip("\"'` .!?").split())
         if not cleaned:
             return ""
 
-        cleaned = re.sub(r"^(?:create|generate|make|write|produce|draft|design)\s+", "", cleaned, flags=re.IGNORECASE)
-        blocked_fragments = {
-            "should",
-            "background",
-            "blurred",
-            "focus",
-            "quality",
-            "emotional",
-            "instructions",
-            "showing",
-            "containing",
-            "displayed",
-            "featuring",
-            "including",
-        }
-        words = cleaned.split()
-        if not 2 <= len(words) <= 6:
-            return ""
-        if any(fragment in cleaned.lower() for fragment in blocked_fragments):
-            return ""
-        if re.search(r"\bwith\b", cleaned, flags=re.IGNORECASE):
-            return ""
-        if cleaned.endswith((",", ";", ":")):
+        valid, _ = FallbackClassifier.validate_intent_label(cleaned)
+        if not valid:
             return ""
         return cleaned
 
@@ -358,16 +345,40 @@ class ChatService:
         analysis: ConversationTurnAnalysis,
         previous_state: ConversationState,
     ) -> str:
-        extracted = self.llm_service.extract_feedback(user_input)
+        response_started_at = time.perf_counter()
+        classification_ms = 0.0
+        followup_generation_ms = 0.0
+
+        extracted = self.llm_service.extract_feedback(user_input, infer_issue_tags=False)
         extracted = self._filter_extraction_to_current_evidence(conversation, user_input, extracted)
         if not self._has_extractable_feedback(extracted):
             conversation.state = ConversationState.FEEDBACK_CONTINUE
             self._log_state("irrelevant_feedback_candidate", conversation, user_input)
+            self._log_response_timing(
+                classification_ms=classification_ms,
+                followup_generation_ms=followup_generation_ms,
+                total_response_ms=self._elapsed_ms(response_started_at),
+            )
             return self._respond(conversation, self._build_off_track_response(conversation, question=self._is_question(user_input)))
 
-        issue = self.llm_service.classify_issue(user_input)
+        classification_started_at = time.perf_counter()
+        issue_categories = self.llm_service.classify_issue_categories(
+            prompt=conversation.prompt or "",
+            feedback_text=user_input,
+            session_context=self._current_session_issue_context(conversation),
+        )
+        category_tags = FallbackClassifier.issue_categories_to_tags(issue_categories)
+        rejected_categories = list(issue_categories.rejected_categories)
+        if category_tags:
+            extracted.issue_tags = category_tags
+        elif extracted.negatives or extracted.suggestions:
+            rejected_categories = self._merge_lists(rejected_categories, extracted.issue_tags)
+            extracted.issue_tags = []
+        self._log_issue_category_classification(user_input, issue_categories, rejected_categories)
+        classification_ms = self._elapsed_ms(classification_started_at)
+
         positive_only = self._is_positive_only_feedback(extracted)
-        issue_type_for_storage = "none" if positive_only else issue.issue_type
+        issue_type_for_storage = "none" if positive_only else self._issue_type_from_categories(issue_categories, extracted)
         rating_already_captured = self._get_context_value(conversation, "rating") is not None
 
         if not rating_already_captured:
@@ -392,6 +403,11 @@ class ChatService:
         if positive_only:
             self._reset_off_track_count(conversation)
             conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_response_timing(
+                classification_ms=classification_ms,
+                followup_generation_ms=followup_generation_ms,
+                total_response_ms=self._elapsed_ms(response_started_at),
+            )
             return self._respond(conversation, self._build_positive_feedback_response(conversation, extracted))
 
         self._update_grounding_memory(conversation, user_input, extracted)
@@ -409,6 +425,11 @@ class ChatService:
                 self._set_context_value(conversation, "rating_prompt_asked", True)
             else:
                 conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_response_timing(
+                classification_ms=classification_ms,
+                followup_generation_ms=followup_generation_ms,
+                total_response_ms=self._elapsed_ms(response_started_at),
+            )
             return self._respond(
                 conversation,
                 self._build_captured_issue_response(conversation, issue_summary),
@@ -422,6 +443,11 @@ class ChatService:
         )
         if completion_reply:
             conversation.state = ConversationState.FEEDBACK_CONTINUE
+            self._log_response_timing(
+                classification_ms=classification_ms,
+                followup_generation_ms=followup_generation_ms,
+                total_response_ms=self._elapsed_ms(response_started_at),
+            )
             return self._respond(conversation, completion_reply)
 
         contextual_follow_up = self._maybe_build_contextual_follow_up(
@@ -462,12 +488,19 @@ class ChatService:
         ):
             base_reply = self._build_progressive_acknowledgement(conversation)
 
+        followup_started_at = time.perf_counter()
         reply = self._append_human_followup_if_needed(
             conversation=conversation,
             base_reply=base_reply,
             user_feedback=user_input,
             extracted=extracted,
             issue_type=issue_type_for_storage,
+        )
+        followup_generation_ms = self._elapsed_ms(followup_started_at)
+        self._log_response_timing(
+            classification_ms=classification_ms,
+            followup_generation_ms=followup_generation_ms,
+            total_response_ms=self._elapsed_ms(response_started_at),
         )
         return self._respond(conversation, reply)
 
@@ -499,7 +532,72 @@ class ChatService:
             positives=extracted.positives,
             negatives=extracted.negatives,
             suggestions=extracted.suggestions,
-            issue_tags=supported_tags or ["other"],
+            issue_tags=supported_tags,
+        )
+
+    def _current_session_issue_context(self, conversation: Conversation) -> str:
+        memory = self._conversation_context(conversation).get("feedback_memory", {})
+        parts: list[str] = []
+        for key in ("positives", "negatives", "suggestions", "issue_tags"):
+            values = memory.get(key, [])
+            if values:
+                parts.append(f"{key}: {', '.join(str(value) for value in values[-8:])}")
+        return " | ".join(parts)
+
+    def _log_issue_category_classification(self, feedback_text: str, issue_categories, rejected_categories: list[str]) -> None:
+        positive_aspects = [item.category for item in issue_categories.positive_aspects]
+        negative_aspects = [item.category for item in [*issue_categories.primary_issues, *issue_categories.secondary_issues]]
+        confidence_scores = {
+            item.category: item.confidence
+            for item in [*issue_categories.positive_aspects, *issue_categories.primary_issues, *issue_categories.secondary_issues]
+        }
+        logger.debug(
+            "issue_category_classification feedback_text=%r groq_categories=%s positive_aspects=%s negative_aspects=%s rejected_categories=%s confidence_scores=%s",
+            feedback_text,
+            {
+                "primary_issues": [item.category for item in issue_categories.primary_issues],
+                "secondary_issues": [item.category for item in issue_categories.secondary_issues],
+            },
+            positive_aspects,
+            negative_aspects,
+            rejected_categories,
+            confidence_scores,
+        )
+
+    def _issue_type_from_categories(self, issue_categories, extracted: FeedbackExtraction) -> str:
+        categories = {
+            item.category
+            for item in [*issue_categories.primary_issues, *issue_categories.secondary_issues]
+            if item.category
+        }
+        technical = {"runtime failure", "slow response time"}
+        usability = {"navigation difficulty", "workflow confusion"}
+        if categories & technical:
+            return "technical"
+        if categories & usability:
+            return "usability"
+        if categories or extracted.negatives or extracted.suggestions:
+            return "quality"
+        return "none"
+
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> float:
+        return round((time.perf_counter() - started_at) * 1000, 2)
+
+    def _log_response_timing(
+        self,
+        *,
+        intent_label_ms: float = 0.0,
+        classification_ms: float = 0.0,
+        followup_generation_ms: float = 0.0,
+        total_response_ms: float = 0.0,
+    ) -> None:
+        logger.debug(
+            "response_timing intent_label_ms=%.2f classification_ms=%.2f followup_generation_ms=%.2f total_response_ms=%.2f",
+            intent_label_ms,
+            classification_ms,
+            followup_generation_ms,
+            total_response_ms,
         )
 
     def _is_feedback_relevant_to_session(
@@ -1482,8 +1580,8 @@ class ChatService:
             "age_mismatch": {"elderly", "old", "young", "age", "aged"},
             "attribute_mismatch": {"description", "attribute", "attributes", "did not match"},
             "prompt_adherence": {"prompt", "instruction", "instructions", "followed", "ignored", "requested", "asked for"},
-            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
-            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements"},
+            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "detail", "details", "basket", "blanket", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
+            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements", "detail", "details"},
             "instruction_following": {"instruction", "instructions", "followed", "ignored", "requested", "asked for"},
             "object_count_errors": {"object count", "count", "three monitors", "two monitors", "too few", "too many"},
             "environmental_scale": {"scale", "environmental scale", "island scale", "terrain"},
@@ -1541,7 +1639,7 @@ class ChatService:
             "branding_fidelity": {"logo", "brand", "branding", "wordmark"},
             "logo_accuracy": {"logo", "brand", "branding", "wordmark"},
             "environmental_density": {"empty", "density", "crowd", "crowds", "busy", "alive", "activity", "drones", "traffic"},
-            "environmental_realism": {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable", "unrealistic", "not realistic", "fake"},
+            "environmental_realism": {"unrealistic", "not realistic", "fake", "artificial", "not believable", "unbelievable"},
             "motion_realism": {"motion", "movement", "moving", "static", "frozen", "action"},
             "lighting_consistency": {"lighting", "light", "shadow", "falloff", "glow", "neon"},
             "texture_realism": {"texture", "surface", "grain"},
@@ -1554,7 +1652,7 @@ class ChatService:
             "perspective_consistency": {"perspective", "aerial", "angle", "vanishing"},
             "anatomy_accuracy": {"anatomy", "body", "limb", "face", "hand", "pose"},
             "cinematic_alignment": {"cinematic", "film", "mood", "atmosphere", "cyberpunk", "neon", "visual style", "style"},
-            "detail_sharpness": {"sharp", "sharpness", "blurry", "detail", "details"},
+            "detail_sharpness": {"sharp", "sharpness", "blurry", "blurred", "not sharp"},
             "other": set(),
         }
         allowed = support.get(tag)
@@ -1749,7 +1847,7 @@ class ChatService:
 
     def _summary_issue_dimensions(self, issue_tags: list, negatives: list, suggestions: list) -> str:
         labels = [self._humanize_issue_tag(tag) for tag in issue_tags or [] if tag]
-        labels = [label for label in labels if label]
+        labels = self._filter_display_categories([label for label in labels if label])
         if not labels:
             combined = " ".join(str(item) for item in list(negatives or []) + list(suggestions or [])).lower()
             inferred: list[str] = []
@@ -1763,7 +1861,7 @@ class ChatService:
                 inferred.append("texture realism")
             if "scale" in combined or "massive" in combined:
                 inferred.append("scale consistency")
-            labels = inferred
+            labels = self._filter_display_categories(inferred)
         return self._format_summary_labels(labels[:3])
 
     def _humanize_issue_tag(self, tag: str) -> str:
@@ -2216,10 +2314,13 @@ class ChatService:
             return ""
 
         dimensions = self._infer_issue_dimensions(conversation, user_input, extracted, issue_type)
+        dimensions = self._filter_display_categories(dimensions)
         if not dimensions:
-            return ""
+            return self._build_evidence_based_issue_summary(user_input, extracted)
 
         phrase = self._format_issue_dimensions(dimensions)
+        if not phrase:
+            return self._build_evidence_based_issue_summary(user_input, extracted)
 
         realism_dimensions = {
             "scale",
@@ -2306,7 +2407,7 @@ class ChatService:
         if any(token in textual_evidence for token in {"description", "attribute", "attributes", "did not match", "does not match"}):
             add("attribute mismatch")
         if any(token in textual_evidence for token in {"missing", "missed", "ignored", "left out", "omitted"}):
-            if any(token in textual_evidence for token in {"object", "objects", "element", "elements", "monitor", "monitors", "headphones", "sticky notes", "desk plant"}):
+            if any(token in textual_evidence for token in {"object", "objects", "element", "elements", "detail", "details", "basket", "blanket", "monitor", "monitors", "headphones", "sticky notes", "desk plant"}):
                 add("missing objects")
             add("prompt adherence")
             add("instruction following")
@@ -2323,7 +2424,7 @@ class ChatService:
             add("lighting consistency")
         if any(token in normalized for token in {"integrated", "integration", "naturally integrated"}):
             add("environmental integration")
-        elif any(token in normalized for token in {"environment", "scene", "water", "ocean"}):
+        elif any(token in normalized for token in {"unrealistic", "not realistic", "fake", "artificial", "not believable", "unbelievable"}):
             add("environmental realism")
         if any(token in normalized for token in {"syrup", "butter", "melt", "melting", "pour", "flow", "fluid", "liquid", "behave"}):
             add("material behavior")
@@ -2337,7 +2438,7 @@ class ChatService:
             add("tone consistency")
         if any(token in normalized for token in {"style", "cartoon", "anime", "cinematic"}):
             add("style alignment")
-        if any(token in normalized for token in {"blurry", "sharpness", "sharp", "detail", "details"}):
+        if any(token in normalized for token in {"blurry", "blurred", "sharpness", "sharp", "not sharp"}):
             add("detail sharpness")
         if any(token in normalized for token in {"reflection", "reflections", "metal", "metallic"}):
             add("material finish")
@@ -2386,10 +2487,28 @@ class ChatService:
             for dimension in dimensions
             if self._issue_dimension_supported_by_current_evidence(dimension, current_evidence)
         ]
-        if not filtered:
-            filtered = ["other"]
-
         return filtered[:4]
+
+    def _filter_display_categories(self, categories: list[str]) -> list[str]:
+        return [
+            category
+            for category in categories
+            if category and category.strip().lower() not in self.STORAGE_ONLY_DISPLAY_CATEGORIES
+        ]
+
+    def _build_evidence_based_issue_summary(self, user_input: str, extracted: FeedbackExtraction) -> str:
+        evidence = " ".join([user_input, *extracted.negatives, *extracted.suggestions]).lower()
+        if any(token in evidence for token in {"empty", "unfinished", "too simple", "simple", "lack of detail", "lacked detail"}):
+            return "It sounds like the output was missing the richness and detail you were expecting."
+        if any(token in evidence for token in {"not what i imagined", "wasn't what i imagined", "not what i expected", "did not match my expectations", "didn't match my expectations"}):
+            return "It sounds like the result did not fully match your expectations."
+        if any(token in evidence for token in {"missing", "missed", "left out", "omitted", "not included"}):
+            return "It sounds like the output was missing important aspects you were hoping for."
+        if any(token in evidence for token in {"flat", "weak", "unfinished", "incomplete"}):
+            return "It sounds like important aspects of the result were not meeting your expectations."
+        if extracted.negatives or extracted.suggestions:
+            return "It sounds like the result did not fully match what you had in mind."
+        return ""
 
     def _combine_issue_summary_with_reply(self, issue_summary: str, base_reply: str) -> str:
         if not issue_summary or issue_summary.lower() in base_reply.lower():

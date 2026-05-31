@@ -6,7 +6,7 @@ from typing import Type, TypeVar
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableSerializable
 from langchain_groq import ChatGroq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 from app.schemas.llm import (
@@ -23,6 +23,7 @@ from app.services.chains.prompts import (
     FEEDBACK_EXTRACTION_PROMPT,
     FEEDBACK_INSIGHTS_PROMPT,
     HUMAN_FOLLOWUP_PROMPT,
+    ISSUE_CATEGORY_CLASSIFICATION_PROMPT,
     INTENT_LABEL_REFINEMENT_PROMPT,
     INTENT_LABEL_PROMPT,
     INTENT_PROMPT,
@@ -30,6 +31,7 @@ from app.services.chains.prompts import (
     ISSUE_TAG_PROMPT,
     RATING_PROMPT,
     SENTIMENT_PROMPT,
+    STRICT_INTENT_LABEL_PROMPT,
     TURN_ANALYSIS_PROMPT,
 )
 
@@ -40,9 +42,26 @@ class IssueTagResult(BaseModel):
     issue_tags: list[str]
 
 
+class IssueCategoryItem(BaseModel):
+    category: str = ""
+    confidence: float = 0.0
+
+
+class IssueCategoryClassificationResult(BaseModel):
+    primary_issues: list[IssueCategoryItem] = Field(default_factory=list)
+    secondary_issues: list[IssueCategoryItem] = Field(default_factory=list)
+    positive_aspects: list[IssueCategoryItem] = Field(default_factory=list)
+    rejected_categories: list[str] = Field(default_factory=list)
+
+
 class IntentLabelResult(BaseModel):
     intent_label: str = ""
     confidence: float = 0.0
+    groq_label: str = ""
+    refined_label: str = ""
+    validation_result: str = ""
+    retry_used: bool = False
+    fallback_used: bool = False
 
 
 class IntentLabelRefinementResult(BaseModel):
@@ -72,6 +91,33 @@ class StructuredChainFactory:
 
 
 class FallbackClassifier:
+    _INTENT_ARTICLES = {"a", "an", "the"}
+    _INTENT_PREPOSITIONS = {"to", "for", "with", "of", "in", "on", "near", "at", "by", "from", "into", "onto"}
+    _INTENT_INSTRUCTION_VERBS = {
+        "create",
+        "write",
+        "generate",
+        "design",
+        "make",
+        "produce",
+        "draft",
+        "render",
+        "compose",
+    }
+    _INTENT_UNFINISHED_MARKERS = {
+        "showing",
+        "containing",
+        "displayed",
+        "featuring",
+        "including",
+        "should",
+        "background",
+        "quality",
+        "instructions",
+        "tone",
+        "feel",
+        "near",
+    }
     POSITIVE_HINTS = {
         "good",
         "great",
@@ -416,7 +462,7 @@ class FallbackClassifier:
         )
 
     @classmethod
-    def refine_feedback(cls, message: str, extraction: FeedbackExtraction) -> FeedbackExtraction:
+    def refine_feedback(cls, message: str, extraction: FeedbackExtraction, *, infer_issue_tags: bool = True) -> FeedbackExtraction:
         positives: list[str] = []
         negatives: list[str] = []
         suggestions: list[str] = []
@@ -447,11 +493,9 @@ class FallbackClassifier:
         positives = cls._dedupe_preserve([*positives, *inferred["positives"]])[:5]
         negatives = cls._dedupe_preserve([*negatives, *inferred["negatives"]])[:6]
         suggestions = cls._dedupe_preserve([*suggestions, *inferred["suggestions"]])[:5]
-        issue_tags = (
-            cls._best_issue_tags(message, positives, negatives, suggestions, extraction.issue_tags)
-            if negatives or suggestions
-            else []
-        )
+        issue_tags = []
+        if infer_issue_tags and (negatives or suggestions):
+            issue_tags = cls._best_issue_tags(message, positives, negatives, suggestions, extraction.issue_tags)
         sentiment = cls._structured_sentiment(positives, negatives, suggestions)
 
         return FeedbackExtraction(
@@ -478,6 +522,267 @@ class FallbackClassifier:
         if cls._is_off_topic_message(message):
             return []
         return cls._best_issue_tags(message, [], [], [], [])
+
+    @classmethod
+    def classify_issue_categories(
+        cls,
+        *,
+        prompt: str,
+        feedback_text: str,
+        session_context: str = "",
+        confidence_threshold: float = 0.7,
+        proposed: IssueCategoryClassificationResult | None = None,
+        allow_fallback_supplement: bool = True,
+    ) -> IssueCategoryClassificationResult:
+        result = proposed or cls._fallback_issue_categories(
+            prompt=prompt,
+            feedback_text=feedback_text,
+            session_context=session_context,
+        )
+        return cls._validate_issue_categories(
+            result,
+            prompt=prompt,
+            feedback_text=feedback_text,
+            session_context=session_context,
+            confidence_threshold=confidence_threshold,
+            allow_fallback_supplement=allow_fallback_supplement,
+        )
+
+    @classmethod
+    def _fallback_issue_categories(
+        cls,
+        *,
+        prompt: str,
+        feedback_text: str,
+        session_context: str = "",
+    ) -> IssueCategoryClassificationResult:
+        normalized = feedback_text.lower()
+        primary: list[IssueCategoryItem] = []
+        positive: list[IssueCategoryItem] = []
+
+        def add_issue(category: str, confidence: float) -> None:
+            if category not in {item.category for item in primary}:
+                primary.append(IssueCategoryItem(category=category, confidence=confidence))
+
+        def add_positive(category: str, confidence: float) -> None:
+            if category not in {item.category for item in positive}:
+                positive.append(IssueCategoryItem(category=category, confidence=confidence))
+
+        if any(token in normalized for token in {"realistic", "realism", "believable", "lifelike"}) and not cls._has_negative_realism_signal(normalized):
+            add_positive("realism", 0.92)
+        if any(token in normalized for token in {"cute", "great", "beautiful", "nice", "appealing", "looked good", "looked great"}):
+            add_positive("visual appeal", 0.85)
+        if any(token in normalized for token in {"missing", "missed", "left out", "omitted", "not included"}):
+            add_issue("missing objects", 0.94)
+            add_issue("prompt adherence", 0.88)
+        if any(token in normalized for token in {"unreadable", "illegible", "hard to read", "can't read", "could not read"}):
+            add_issue("text readability", 0.95)
+        if any(token in normalized for token in {"massive", "scale", "size", "proportion", "proportions", "too small", "too large"}):
+            add_issue("scale consistency", 0.9)
+        if cls._has_negative_realism_signal(normalized):
+            add_issue("realism", 0.88)
+        if any(token in normalized for token in {"blurry", "blurred", "not sharp", "sharpness"}):
+            add_issue("detail sharpness", 0.85)
+
+        return IssueCategoryClassificationResult(
+            primary_issues=primary[:3],
+            secondary_issues=[],
+            positive_aspects=positive[:3],
+            rejected_categories=[],
+        )
+
+    @classmethod
+    def _validate_issue_categories(
+        cls,
+        result: IssueCategoryClassificationResult,
+        *,
+        prompt: str,
+        feedback_text: str,
+        session_context: str,
+        confidence_threshold: float,
+        allow_fallback_supplement: bool,
+    ) -> IssueCategoryClassificationResult:
+        evidence = " ".join([feedback_text, session_context]).lower()
+        rejected: list[str] = list(result.rejected_categories or [])
+        positive_categories = {
+            cls._normalize_issue_category(item.category)
+            for item in result.positive_aspects
+            if item.confidence >= confidence_threshold and cls._positive_category_supported(item.category, evidence)
+        }
+
+        def clean_items(items: list[IssueCategoryItem], *, positive: bool) -> list[IssueCategoryItem]:
+            cleaned: list[IssueCategoryItem] = []
+            for item in items:
+                category = cls._normalize_issue_category(item.category)
+                confidence = float(item.confidence or 0.0)
+                if not category:
+                    continue
+                if confidence < confidence_threshold:
+                    rejected.append(category)
+                    continue
+                supported = (
+                    cls._positive_category_supported(category, evidence)
+                    if positive
+                    else cls._negative_category_supported(category, evidence)
+                )
+                if not supported:
+                    rejected.append(category)
+                    continue
+                if not positive and cls._category_contradicted_by_praise(category, evidence):
+                    rejected.append(category)
+                    continue
+                if not positive and category in positive_categories and not cls._explicit_negative_for_category(category, evidence):
+                    rejected.append(category)
+                    continue
+                if category not in {existing.category for existing in cleaned}:
+                    cleaned.append(IssueCategoryItem(category=category, confidence=confidence))
+            return cleaned
+
+        positives = clean_items(result.positive_aspects, positive=True)
+        primary = clean_items(result.primary_issues, positive=False)
+        secondary = [
+            item
+            for item in clean_items(result.secondary_issues, positive=False)
+            if item.category not in {primary_item.category for primary_item in primary}
+        ]
+        if allow_fallback_supplement or not (primary or secondary or positives):
+            fallback = cls._fallback_issue_categories(
+                prompt=prompt,
+                feedback_text=feedback_text,
+                session_context=session_context,
+            )
+            existing_negative_categories = {item.category for item in [*primary, *secondary]}
+            for item in fallback.primary_issues:
+                category = cls._normalize_issue_category(item.category)
+                if category in existing_negative_categories:
+                    continue
+                if not cls._negative_category_supported(category, evidence):
+                    continue
+                if cls._category_contradicted_by_praise(category, evidence):
+                    continue
+                primary.append(IssueCategoryItem(category=category, confidence=item.confidence))
+                existing_negative_categories.add(category)
+            existing_positive_categories = {item.category for item in positives}
+            for item in fallback.positive_aspects:
+                category = cls._normalize_issue_category(item.category)
+                if category in existing_positive_categories:
+                    continue
+                if cls._positive_category_supported(category, evidence):
+                    positives.append(IssueCategoryItem(category=category, confidence=item.confidence))
+                    existing_positive_categories.add(category)
+        return IssueCategoryClassificationResult(
+            primary_issues=primary[:4],
+            secondary_issues=secondary[:4],
+            positive_aspects=positives[:4],
+            rejected_categories=cls._dedupe_preserve(rejected)[:10],
+        )
+
+    @classmethod
+    def issue_categories_to_tags(cls, result: IssueCategoryClassificationResult) -> list[str]:
+        tags: list[str] = []
+        for item in [*result.primary_issues, *result.secondary_issues]:
+            tag = cls._issue_category_to_tag(item.category)
+            if tag and tag not in tags:
+                tags.append(tag)
+        return tags
+
+    @staticmethod
+    def _normalize_issue_category(category: str) -> str:
+        cleaned = " ".join(str(category or "").strip().lower().replace("_", " ").split())
+        aliases = {
+            "readability": "text readability",
+            "text rendering": "text readability",
+            "typography fidelity": "text readability",
+            "missing elements": "missing objects",
+            "prompt alignment": "prompt adherence",
+            "instruction following": "prompt adherence",
+            "image sharpness": "detail sharpness",
+            "sharpness": "detail sharpness",
+            "environmental realism": "realism",
+            "environmental believability": "realism",
+        }
+        return aliases.get(cleaned, cleaned)
+
+    @staticmethod
+    def _issue_category_to_tag(category: str) -> str:
+        mapping = {
+            "missing objects": "missing_objects",
+            "prompt adherence": "prompt_adherence",
+            "text readability": "readability",
+            "scale consistency": "scale_consistency",
+            "realism": "environmental_realism",
+            "detail sharpness": "detail_sharpness",
+            "chart readability": "chart_readability",
+            "label accuracy": "label_fidelity",
+            "branding fidelity": "branding_fidelity",
+            "motion realism": "motion_realism",
+            "lighting consistency": "lighting_consistency",
+            "texture realism": "texture_realism",
+            "material realism": "material_realism",
+            "composition balance": "composition_balance",
+            "natural posing": "anatomy_accuracy",
+        }
+        return mapping.get(category, category.replace(" ", "_"))
+
+    @classmethod
+    def _positive_category_supported(cls, category: str, evidence: str) -> bool:
+        category = cls._normalize_issue_category(category)
+        support = {
+            "realism": {"realistic", "realism", "believable", "lifelike", "looked real"},
+            "visual appeal": {"cute", "great", "beautiful", "nice", "appealing", "looked good", "looked great"},
+            "composition": {"composition", "framing", "layout"},
+            "style": {"style", "cinematic", "professional"},
+        }
+        terms = support.get(category, {category})
+        return any(cls._evidence_contains(evidence, term) for term in terms)
+
+    @classmethod
+    def _negative_category_supported(cls, category: str, evidence: str) -> bool:
+        category = cls._normalize_issue_category(category)
+        support = {
+            "missing objects": {"missing", "missed", "left out", "omitted", "not included"},
+            "prompt adherence": {"missing", "missed", "ignored", "prompt", "asked for", "requested", "should have", "not included"},
+            "text readability": {"unreadable", "illegible", "hard to read", "can't read", "could not read"},
+            "scale consistency": {"massive", "scale", "size", "proportion", "proportions", "too small", "too large"},
+            "realism": {"unrealistic", "not realistic", "fake", "artificial", "not believable"},
+            "detail sharpness": {"blurry", "blurred", "not sharp", "sharpness"},
+            "chart readability": {"unreadable chart", "illegible chart", "hard to read chart", "unclear chart", "confusing chart"},
+            "label accuracy": {"label", "caption", "annotation", "wrong", "incorrect", "mislabeled", "mislabelled"},
+            "branding fidelity": {"logo", "brand", "branding", "wordmark"},
+            "motion realism": {"motion", "movement", "static", "frozen"},
+            "lighting consistency": {"lighting", "light", "shadow", "falloff"},
+            "texture realism": {"texture", "surface", "grain"},
+            "material realism": {"material", "metal", "fabric", "skin", "plastic"},
+            "composition balance": {"composition", "framing", "layout", "balance"},
+            "natural posing": {"pose", "posing", "staged", "unnatural"},
+        }
+        terms = support.get(category)
+        if not terms:
+            return False
+        return any(cls._evidence_contains(evidence, term) for term in terms)
+
+    @classmethod
+    def _category_contradicted_by_praise(cls, category: str, evidence: str) -> bool:
+        category = cls._normalize_issue_category(category)
+        if category == "realism":
+            return any(
+                phrase in evidence
+                for phrase in {"looked realistic", "very realistic", "realistic and", "looked real", "felt realistic"}
+            ) and not cls._has_negative_realism_signal(evidence)
+        if category == "detail sharpness":
+            return "details from the prompt were missing" in evidence or "key details from the prompt were missing" in evidence
+        return False
+
+    @classmethod
+    def _explicit_negative_for_category(cls, category: str, evidence: str) -> bool:
+        category = cls._normalize_issue_category(category)
+        if category == "realism":
+            return cls._has_negative_realism_signal(evidence)
+        return cls._negative_category_supported(category, evidence)
+
+    @staticmethod
+    def _has_negative_realism_signal(evidence: str) -> bool:
+        return any(token in evidence for token in {"unrealistic", "not realistic", "fake", "artificial", "not believable"})
 
     @classmethod
     def _is_off_topic_message(cls, message: str) -> bool:
@@ -577,7 +882,7 @@ class FallbackClassifier:
         if any(token in normalized for token in {"description", "attribute", "attributes", "did not match", "does not match"}):
             add("attribute_mismatch")
         if any(token in normalized for token in {"missing", "missed", "ignored", "left out", "left-out", "omitted", "not included"}):
-            if any(token in normalized for token in {"object", "objects", "element", "elements", "monitor", "monitors", "headphones", "sticky notes", "desk plant"}):
+            if any(token in normalized for token in {"object", "objects", "element", "elements", "detail", "details", "basket", "blanket", "monitor", "monitors", "headphones", "sticky notes", "desk plant"}):
                 add("missing_objects")
                 add("missing_elements")
             add("prompt_adherence")
@@ -603,7 +908,7 @@ class FallbackClassifier:
             any(token in normalized for token in {"unrealistic", "not realistic", "fake", "artificial"})
             or ("realism" in normalized and any(token in normalized for token in {"missing", "lacked", "weak", "breaks", "issue", "problem"}))
         )
-        if any(token in normalized for token in {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable"}) or realism_complaint:
+        if realism_complaint or any(token in normalized for token in {"not believable", "unbelievable"}):
             add("environmental_realism")
         if any(token in normalized for token in {"motion", "movement", "moving", "static", "frozen", "action"}):
             add("motion_realism")
@@ -629,7 +934,7 @@ class FallbackClassifier:
             add("anatomy_accuracy")
         if any(token in normalized for token in {"cinematic", "film", "mood", "atmosphere", "cyberpunk", "neon", "visual style", "style looked strong"}):
             add("cinematic_alignment")
-        if any(token in normalized for token in {"sharp", "sharpness", "blurry", "detail", "details"}):
+        if any(token in normalized for token in {"sharp", "sharpness", "blurry", "blurred", "not sharp"}):
             add("detail_sharpness")
 
         if not tags and realism_complaint:
@@ -656,13 +961,13 @@ class FallbackClassifier:
             "age_mismatch": {"elderly", "old", "young", "age", "aged"},
             "attribute_mismatch": {"description", "attribute", "attributes", "did not match"},
             "prompt_adherence": {"missing", "missed", "ignored", "instruction", "instructions", "followed", "prompt", "requested", "asked for", "should have contained"},
-            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
-            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements", "object", "objects"},
+            "missing_objects": {"missing", "missed", "ignored", "left out", "omitted", "object", "objects", "detail", "details", "basket", "blanket", "monitor", "monitors", "headphones", "sticky notes", "desk plant"},
+            "missing_elements": {"missing", "missed", "ignored", "left out", "omitted", "element", "elements", "detail", "details", "object", "objects"},
             "instruction_following": {"ignored", "instruction", "instructions", "followed", "prompt", "requested", "asked for", "should have contained"},
             "object_count_errors": {"object count", "count", "three monitors", "two monitors", "too few", "too many"},
             "environmental_density": {"empty", "density", "crowd", "crowds", "busy", "alive", "activity", "drones", "traffic"},
-            "environmental_realism": {"environment", "city", "street", "scene", "underwater", "water", "ocean", "believable", "realism", "realistic", "unrealistic"},
-            "environmental_believability": {"environment", "city", "street", "scene", "believable", "realism", "realistic", "unrealistic"},
+            "environmental_realism": {"unrealistic", "not realistic", "fake", "artificial", "not believable", "unbelievable"},
+            "environmental_believability": {"unrealistic", "not realistic", "fake", "artificial", "not believable", "unbelievable"},
             "motion_realism": {"motion", "movement", "moving", "static", "frozen", "action"},
             "lighting_consistency": {"lighting", "light", "shadow", "falloff", "glow", "neon"},
             "texture_realism": {"texture", "surface", "grain"},
@@ -675,7 +980,7 @@ class FallbackClassifier:
             "perspective_consistency": {"perspective", "aerial", "angle", "vanishing"},
             "anatomy_accuracy": {"anatomy", "body", "limb", "face", "hand", "pose"},
             "cinematic_alignment": {"cinematic", "film", "mood", "atmosphere", "cyberpunk", "neon", "visual style", "style"},
-            "detail_sharpness": {"sharp", "sharpness", "blurry", "detail", "details"},
+            "detail_sharpness": {"sharp", "sharpness", "blurry", "blurred", "not sharp"},
             "prompt_alignment": {"prompt", "missed prompt", "did not follow", "didn't follow", "ignored"},
             "navigation_difficulty": {"navigation", "hard to find", "difficult to find"},
             "slow_response_time": {"slow", "minutes", "delay", "took"},
@@ -1014,7 +1319,16 @@ class FallbackClassifier:
     def generate_intent_label(cls, *, task_type: str, prompt: str) -> IntentLabelResult:
         label = cls._fallback_intent_label(task_type, prompt)
         refined = cls.refine_intent_label(label, prompt=prompt)
-        return IntentLabelResult(intent_label=refined, confidence=0.78 if refined else 0.0)
+        valid, validation_result = cls.validate_intent_label(refined)
+        if not valid:
+            refined = ""
+        return IntentLabelResult(
+            intent_label=refined,
+            confidence=0.78 if refined else 0.0,
+            refined_label=refined,
+            validation_result=validation_result,
+            fallback_used=True,
+        )
 
     @classmethod
     def refine_intent_label(cls, raw_label: str, *, prompt: str = "") -> str:
@@ -1037,10 +1351,10 @@ class FallbackClassifier:
             return "presentation slide"
 
         if "underwater" in normalized and "photograph" in normalized:
-            if "whale" in normalized or "whale" in prompt_normalized:
-                return "underwater whale photograph"
             if "wildlife" in normalized or "wildlife" in prompt_normalized or "marine" in normalized or "marine" in prompt_normalized:
-                return "marine wildlife photograph"
+                return "underwater wildlife photograph"
+            if "whale" in normalized or "whale" in prompt_normalized:
+                return "whale photography scene"
 
         cleaned = re.split(
             r"\s+\b(?:showing|containing|displayed|featuring|including|with)\b",
@@ -1058,11 +1372,65 @@ class FallbackClassifier:
             return ""
         return cleaned
 
+    @classmethod
+    def validate_intent_label(cls, label: str) -> tuple[bool, str]:
+        cleaned = " ".join((label or "").strip().strip("\"'` .!?").split())
+        if not cleaned:
+            return False, "empty"
+
+        words = cleaned.split()
+        if not 2 <= len(words) <= 6:
+            return False, "invalid_word_count"
+
+        normalized_words = [word.lower().strip(" ,.;:-!?\"'`()[]{}") for word in words]
+        if not normalized_words:
+            return False, "empty"
+
+        final_word = normalized_words[-1]
+        if final_word in cls._INTENT_ARTICLES:
+            return False, "ends_with_article"
+        if final_word in cls._INTENT_PREPOSITIONS:
+            return False, "ends_with_preposition"
+        if any(word in cls._INTENT_INSTRUCTION_VERBS for word in normalized_words):
+            return False, "contains_instruction_verb"
+
+        normalized = " ".join(normalized_words)
+        if any(re.search(rf"\b{re.escape(marker)}\b", normalized) for marker in cls._INTENT_UNFINISHED_MARKERS):
+            return False, "contains_unfinished_clause"
+        if re.search(r"\b(?:to|for|with|of|in|on|near|at|by|from)\s+(?:a|an|the)?$", normalized):
+            return False, "unfinished_prepositional_phrase"
+        if cleaned.endswith((",", ";", ":")):
+            return False, "trailing_punctuation"
+        return True, "pass"
+
     @staticmethod
     def _fallback_intent_label(task_type: str, prompt: str) -> str:
         task = (task_type or "").lower()
         normalized = prompt.lower()
 
+        if task == "text" or any(token in normalized for token in {"email", "message", "letter", "post", "caption", "announcement"}):
+            if "email" in normalized and any(token in normalized for token in {"thank", "thanking", "appreciat", "loyal", "loyalty"}):
+                if "loyal" in normalized or "loyalty" in normalized:
+                    return "loyalty thank-you email"
+                return "customer appreciation email"
+            if "email" in normalized and "customer" in normalized:
+                return "customer email"
+            if "message" in normalized and any(token in normalized for token in {"thank", "thanking", "appreciat"}):
+                return "thank-you message"
+
+        if "world map" in normalized:
+            return "fantasy world map" if "fantasy" in normalized else "world map"
+        if "presentation slide" in normalized:
+            if "conference" in normalized:
+                return "conference presentation slide"
+            if "business" in normalized:
+                return "business presentation slide"
+            return "presentation slide"
+        if "underwater" in normalized and any(token in normalized for token in {"photo", "photograph", "image"}):
+            if "wildlife" in normalized:
+                return "underwater wildlife photograph"
+            if "whale" in normalized:
+                return "whale photography scene"
         if any(token in normalized for token in {"potter", "pottery", "artisan"}):
             if "portrait" in normalized:
                 return "portrait of a pottery artisan"
@@ -1180,9 +1548,14 @@ class FeedbackLLMService:
         self._extraction_chain = self._build_optional_chain(FEEDBACK_EXTRACTION_PROMPT, FeedbackExtraction)
         self._issue_chain = self._build_optional_chain(ISSUE_CLASSIFICATION_PROMPT, IssueClassification)
         self._tag_chain = self._build_optional_chain(ISSUE_TAG_PROMPT, IssueTagResult)
+        self._issue_category_chain = self._build_optional_chain(
+            ISSUE_CATEGORY_CLASSIFICATION_PROMPT,
+            IssueCategoryClassificationResult,
+        )
         self._human_followup_chain = self._build_optional_chain(HUMAN_FOLLOWUP_PROMPT, HumanFollowupQuestionResult)
         self._feedback_insights_chain = self._build_optional_chain(FEEDBACK_INSIGHTS_PROMPT, FeedbackInsightsResult)
         self._intent_label_chain = self._build_optional_chain(INTENT_LABEL_PROMPT, IntentLabelResult)
+        self._strict_intent_label_chain = self._build_optional_chain(STRICT_INTENT_LABEL_PROMPT, IntentLabelResult)
         self._intent_label_refinement_chain = self._build_optional_chain(
             INTENT_LABEL_REFINEMENT_PROMPT,
             IntentLabelRefinementResult,
@@ -1213,13 +1586,22 @@ class FeedbackLLMService:
             return self._sentiment_chain.invoke({"message": message})
         return FallbackClassifier.analyze_sentiment(message)
 
-    def extract_feedback(self, message: str) -> FeedbackExtraction:
+    def extract_feedback(self, message: str, *, infer_issue_tags: bool = True) -> FeedbackExtraction:
         if self._extraction_chain:
             extraction = self._extraction_chain.invoke({"message": message})
-            if not extraction.issue_tags:
+            if infer_issue_tags and not extraction.issue_tags:
                 extraction.issue_tags = self.generate_issue_tags(message)
-            return FallbackClassifier.refine_feedback(message, extraction)
-        return FallbackClassifier.extract_feedback(message)
+            return FallbackClassifier.refine_feedback(message, extraction, infer_issue_tags=infer_issue_tags)
+        extraction = FallbackClassifier.extract_feedback(message)
+        if infer_issue_tags:
+            return extraction
+        return FeedbackExtraction(
+            sentiment=extraction.sentiment,
+            positives=extraction.positives,
+            negatives=extraction.negatives,
+            suggestions=extraction.suggestions,
+            issue_tags=[],
+        )
 
     def classify_issue(self, message: str) -> IssueClassification:
         if self._issue_chain:
@@ -1230,6 +1612,40 @@ class FeedbackLLMService:
         if self._tag_chain:
             return FallbackClassifier._best_issue_tags(message, [], [], [], self._tag_chain.invoke({"message": message}).issue_tags)
         return FallbackClassifier.generate_issue_tags(message)
+
+    def classify_issue_categories(
+        self,
+        *,
+        prompt: str,
+        feedback_text: str,
+        session_context: str = "",
+    ) -> IssueCategoryClassificationResult:
+        threshold = get_settings().issue_category_confidence_threshold
+        if self._issue_category_chain:
+            try:
+                proposed = self._issue_category_chain.invoke(
+                    {
+                        "prompt": prompt,
+                        "feedback_text": feedback_text,
+                        "session_context": session_context,
+                    }
+                )
+                return FallbackClassifier.classify_issue_categories(
+                    prompt=prompt,
+                    feedback_text=feedback_text,
+                    session_context=session_context,
+                    confidence_threshold=threshold,
+                    proposed=proposed,
+                    allow_fallback_supplement=False,
+                )
+            except Exception:
+                pass
+        return FallbackClassifier.classify_issue_categories(
+            prompt=prompt,
+            feedback_text=feedback_text,
+            session_context=session_context,
+            confidence_threshold=threshold,
+        )
 
     def generate_human_followup_question(self, **payload) -> HumanFollowupQuestionResult:
         if self._human_followup_chain:
@@ -1242,19 +1658,96 @@ class FeedbackLLMService:
         return FallbackClassifier.generate_feedback_insights(**payload)
 
     def generate_intent_label(self, *, task_type: str, prompt: str) -> IntentLabelResult:
-        raw_result: IntentLabelResult
-        if self._intent_label_chain:
-            try:
-                raw_result = self._intent_label_chain.invoke({"task_type": task_type, "prompt": prompt})
-            except Exception:
-                raw_result = FallbackClassifier.generate_intent_label(task_type=task_type, prompt=prompt)
-        else:
-            raw_result = FallbackClassifier.generate_intent_label(task_type=task_type, prompt=prompt)
+        retry_used = False
+        groq_label = ""
 
-        refined_label = self.refine_intent_label(raw_result.intent_label, prompt=prompt)
+        if not self._intent_label_chain:
+            return FallbackClassifier.generate_intent_label(task_type=task_type, prompt=prompt)
+
+        try:
+            raw_result = self._intent_label_chain.invoke({"task_type": task_type, "prompt": prompt})
+        except Exception:
+            return self._fallback_intent_label_result(
+                task_type=task_type,
+                prompt=prompt,
+                groq_label=groq_label,
+                retry_used=retry_used,
+                validation_result="groq_unavailable_or_timeout",
+            )
+
+        groq_label = raw_result.intent_label or ""
+        if not groq_label.strip():
+            return self._fallback_intent_label_result(
+                task_type=task_type,
+                prompt=prompt,
+                groq_label=groq_label,
+                retry_used=retry_used,
+                validation_result="empty_groq_label",
+            )
+
+        refined_label = self.refine_intent_label(groq_label, prompt=prompt)
+        valid, validation_result = FallbackClassifier.validate_intent_label(refined_label)
+        confidence = raw_result.confidence if valid else 0.0
+        if valid:
+            return IntentLabelResult(
+                intent_label=refined_label,
+                confidence=confidence,
+                groq_label=groq_label,
+                refined_label=refined_label,
+                validation_result=validation_result,
+                retry_used=retry_used,
+                fallback_used=False,
+            )
+
+        if self._strict_intent_label_chain:
+            retry_used = True
+            try:
+                retry_result = self._strict_intent_label_chain.invoke({"task_type": task_type, "prompt": prompt})
+                groq_label = retry_result.intent_label or ""
+                if groq_label.strip():
+                    refined_label = self.refine_intent_label(groq_label, prompt=prompt)
+                    valid, validation_result = FallbackClassifier.validate_intent_label(refined_label)
+                    if valid:
+                        return IntentLabelResult(
+                            intent_label=refined_label,
+                            confidence=retry_result.confidence,
+                            groq_label=groq_label,
+                            refined_label=refined_label,
+                            validation_result=validation_result,
+                            retry_used=retry_used,
+                            fallback_used=False,
+                        )
+                else:
+                    validation_result = "empty_retry_label"
+            except Exception:
+                validation_result = "retry_groq_unavailable_or_timeout"
+
+        return self._fallback_intent_label_result(
+            task_type=task_type,
+            prompt=prompt,
+            groq_label=groq_label,
+            retry_used=retry_used,
+            validation_result=validation_result,
+        )
+
+    def _fallback_intent_label_result(
+        self,
+        *,
+        task_type: str,
+        prompt: str,
+        groq_label: str,
+        retry_used: bool,
+        validation_result: str,
+    ) -> IntentLabelResult:
+        fallback = FallbackClassifier.generate_intent_label(task_type=task_type, prompt=prompt)
         return IntentLabelResult(
-            intent_label=refined_label,
-            confidence=raw_result.confidence if refined_label else 0.0,
+            intent_label=fallback.intent_label,
+            confidence=fallback.confidence,
+            groq_label=groq_label,
+            refined_label=fallback.refined_label or fallback.intent_label,
+            validation_result=validation_result,
+            retry_used=retry_used,
+            fallback_used=True,
         )
 
     def refine_intent_label(self, raw_label: str, *, prompt: str = "") -> str:
