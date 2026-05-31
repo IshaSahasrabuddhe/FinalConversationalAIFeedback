@@ -35,10 +35,46 @@ export default function DashboardPage() {
   const [currentState, setCurrentState] = useState<string>("START");
   const [loading, setLoading] = useState(false);
   const autoStartKeyRef = useRef("");
+  const newConversationTimingRef = useRef<{
+    clickAt: number;
+    apiRequestAt?: number;
+    apiResponseAt?: number;
+    pendingRendered?: boolean;
+    conversationId?: number;
+    shellRendered?: boolean;
+  } | null>(null);
 
   useEffect(() => {
     void hydrate();
   }, []);
+
+  useEffect(() => {
+    const timing = newConversationTimingRef.current;
+    if (!timing || timing.pendingRendered || activeConversationId !== null || messages.length) {
+      return;
+    }
+
+    timing.pendingRendered = true;
+    console.info("new_conversation_timing frontend_pending_ui_render", {
+      click_to_pending_render_ms: Math.round(performance.now() - timing.clickAt),
+    });
+  }, [activeConversationId, messages.length]);
+
+  useEffect(() => {
+    const timing = newConversationTimingRef.current;
+    if (!timing?.conversationId || timing.shellRendered || activeConversationId !== timing.conversationId) {
+      return;
+    }
+
+    timing.shellRendered = true;
+    console.info("new_conversation_timing frontend_shell_ui_render", {
+      conversation_id: timing.conversationId,
+      click_to_shell_render_ms: Math.round(performance.now() - timing.clickAt),
+      api_request_ms:
+        timing.apiRequestAt && timing.apiResponseAt ? Math.round(timing.apiResponseAt - timing.apiRequestAt) : undefined,
+      response_to_render_ms: timing.apiResponseAt ? Math.round(performance.now() - timing.apiResponseAt) : undefined,
+    });
+  }, [activeConversationId]);
 
   useEffect(() => {
     if (!activeConversationId || loading || metadata.is_locked || currentState !== "START") {
@@ -88,14 +124,49 @@ export default function DashboardPage() {
   }
 
   async function handleCreateConversation() {
+    const clickAt = performance.now();
+    newConversationTimingRef.current = { clickAt };
+    console.info("new_conversation_timing frontend_click", { click_at_ms: Math.round(clickAt) });
+
+    setActiveConversationId(null);
+    setMessages([]);
+    setCurrentState("START");
+    setMetadata(EMPTY_METADATA);
+    setSelectedOutputFile(null);
     setLoading(true);
     try {
+      const apiRequestAt = performance.now();
+      newConversationTimingRef.current.apiRequestAt = apiRequestAt;
+      console.info("new_conversation_timing frontend_api_request", {
+        click_to_request_ms: Math.round(apiRequestAt - clickAt),
+      });
+
       const created = await createConversation();
-      const updatedConversations = await listConversations();
-      setConversations(updatedConversations);
+      const apiResponseAt = performance.now();
+      newConversationTimingRef.current.apiResponseAt = apiResponseAt;
+      newConversationTimingRef.current.conversationId = created.conversation_id;
+      console.info("new_conversation_timing frontend_api_response", {
+        conversation_id: created.conversation_id,
+        request_to_response_ms: Math.round(apiResponseAt - apiRequestAt),
+        click_to_response_ms: Math.round(apiResponseAt - clickAt),
+      });
+
       setActiveConversationId(created.conversation_id);
-      const history = await getHistory(created.conversation_id);
-      applyHistory(history);
+      setMessages([]);
+      setCurrentState(created.state);
+      setMetadata(EMPTY_METADATA);
+      setSelectedOutputFile(null);
+      setConversations((current) => [
+        {
+          id: created.conversation_id,
+          title: "New feedback session",
+          state: created.state,
+          created_at: new Date().toISOString(),
+          task_type: null,
+        },
+        ...current.filter((conversation) => conversation.id !== created.conversation_id),
+      ]);
+      void listConversations().then(setConversations).catch(() => undefined);
     } finally {
       setLoading(false);
     }

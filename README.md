@@ -1,19 +1,21 @@
 # AI Feedback Collector
 
-An end-to-end conversational feedback platform built to collect user feedback through a guided AI chat experience, store structured insights, and surface them through an admin analytics dashboard.
+An AI-powered conversational feedback intelligence platform for evaluating AI-generated outputs across text, image, audio, video, and document tasks.
 
-This project combines FastAPI, React, Tailwind CSS, LangChain, Groq, and PostgreSQL-style database support to create a complete feedback collection workflow for both end users and administrators.
+This project combines FastAPI, React, Tailwind CSS, LangChain, Groq, and PostgreSQL-style database support to understand nuanced feedback, produce analytics-ready structured records, and surface those insights through an admin analytics dashboard.
 
 ## Project Overview
 
-AI Feedback Collector helps organizations gather richer feedback than a static form. Instead of asking users to fill out a long survey, the system guides them through a conversation, detects sentiment, extracts issues, captures ratings, and stores structured feedback for reporting.
+AI Feedback Collector helps organizations evaluate AI-generated outputs through context-aware conversation rather than static questionnaires. The system guides users through natural feedback, maintains conversational context, distinguishes positive and negative observations, identifies likely issue categories, captures ratings, and stores structured feedback records for reporting.
+
+The platform is designed to understand feedback about generated outputs across text, image, audio, video, and document tasks. It can identify concerns such as prompt adherence issues, missing elements, subject mismatches, attribute mismatches, readability problems, and general quality concerns while preserving the original conversation for review.
 
 The platform has two main experiences:
 
 - A user-facing chat dashboard where users sign up, log in, and submit feedback conversationally
 - An admin dashboard where internal teams can review conversations, feedback summaries, analytics, issue trends, and user activity
 
-The application is designed to feel simple on the surface while running a structured AI-assisted workflow underneath.
+The application is designed to feel simple on the surface while running a structured AI-assisted workflow underneath. The result is not just raw feedback text, but organized data that can support product analysis, quality review, and cross-conversation trend discovery.
 
 
 ## Live Demo
@@ -43,9 +45,19 @@ If you change the backend environment variables `ADMIN_EMAIL` or `ADMIN_PASSWORD
 
 - User signup and login with JWT authentication
 - Separate admin login flow
-- Conversational feedback collection instead of traditional forms
-- AI-assisted extraction of sentiment, issue type, rating, positives, negatives, and summary
 - Support for different task types such as text, image, audio, video, and document
+- Context-aware conversational feedback collection instead of traditional forms
+- Intelligent issue categorization for generated-output problems
+- Prompt adherence analysis for whether outputs matched the user's request
+- Positive and negative feedback extraction from natural language
+- Rating extraction from natural language responses
+- Redundant question prevention during guided feedback sessions
+- Semantic conversation memory for feedback continuity
+- Session pause and resume handling
+- Off-topic conversation detection
+- Dynamic follow-up questioning based on the current feedback context
+- Structured issue tagging and feedback summarization
+- Analytics-ready feedback generation for dashboard review
 - Persistent storage of users, conversations, messages, and feedback entries
 - Admin dashboard with conversation review, feedback review, user list, analytics, and insight summaries
 - Trend visualizations for sentiment, task usage, issue distribution, and top issue tags
@@ -113,7 +125,7 @@ Core application behavior lives in services such as:
 
 #### 4. AI Layer
 
-The AI layer interprets free-form user feedback into structured data that the admin dashboard can analyze.
+The AI layer interprets free-form user feedback into structured data that the admin dashboard can analyze. It handles intent understanding, feedback interpretation, issue categorization, rating understanding, positive and negative signal extraction, tag generation, summarization, and context-aware conversational guidance.
 
 #### 5. Data Layer
 
@@ -138,7 +150,7 @@ The project uses:
 
 ### How the AI Layer Works
 
-The AI pipeline does not just generate free text. It is used to convert conversation content into structured business data.
+The AI pipeline does not just generate free text or perform basic sentiment extraction. It converts conversation content into structured business data while using session context to understand what the user is evaluating.
 
 Examples of AI tasks in this project:
 
@@ -147,6 +159,10 @@ Examples of AI tasks in this project:
 - Rating extraction
 - Issue classification
 - Feedback extraction
+- Positive and negative signal extraction
+- Prompt adherence interpretation
+- Issue category and tag generation
+- Context-aware follow-up generation
 - Insight generation for admin analytics
 
 ### LangChain Chains
@@ -158,17 +174,83 @@ At a high level, the chains help the backend answer questions like:
 - Is the user actually giving feedback or asking something else?
 - Is the user positive, negative, or mixed?
 - Did the user provide a clear rating?
-- What issue type best describes the feedback?
+- What issue categories best describe the feedback?
+- Did the output miss requested elements or mismatch the prompt?
 - What should be stored as positives, negatives, tags, and summary?
+- What follow-up question would collect useful missing context without repeating earlier questions?
 - What overall insights should be shown to admins?
 
 ### Why This Matters
 
-This approach makes the dashboard more useful for business teams because they are not reviewing only raw text. They also get structured summaries, issue grouping, and trend visibility.
+This approach makes the dashboard more useful for business teams because they are not reviewing only raw text. They also get structured summaries, issue grouping, issue tags, rating trends, prompt adherence signals, and cross-conversation trend visibility.
+
+### Examples of Feedback Understanding
+
+#### Example 1
+
+User:
+
+`The whale looked realistic but didn't feel massive.`
+
+System understanding:
+
+- Scale realism concern
+- Prompt adherence concern
+
+#### Example 2
+
+User:
+
+`The workshop looked correct but the person wasn't what I asked for.`
+
+System understanding:
+
+- Subject mismatch
+- Attribute mismatch
+- Prompt adherence issue
+
+#### Example 3
+
+User:
+
+`The slide was professional but the text was unreadable.`
+
+System understanding:
+
+- Readability issue
+- Information presentation issue
+
+#### Example 4
+
+User:
+
+`The puppy looked great but the basket and blanket were missing.`
+
+System understanding:
+
+- Missing objects
+- Instruction-following issue
 
 ### Fallback Behavior
 
 If a Groq API key is not configured, the system still supports development using deterministic fallback logic so the app remains usable during local testing.
+
+## Conversation Intelligence
+
+The conversation workflow is designed to collect feedback naturally while preserving enough structure for reliable analysis.
+
+Key conversation intelligence capabilities include:
+
+- Semantic memory for retaining what the user has already said in the current session
+- Context retention across feedback turns
+- Feedback continuity when users add more detail after an initial observation
+- Duplicate-question prevention so the assistant does not repeatedly ask for the same information
+- Intelligent rating collection from direct ratings and natural-language rating statements
+- Context-aware follow-up questions based on the current prompt, output, and feedback
+- Session pause and resume support
+- Off-topic handling that redirects the user back to useful feedback collection
+
+This allows the system to keep the interaction lightweight for users while still producing structured data that remains useful for analytics.
 
 ## Database Overview
 
@@ -231,7 +313,7 @@ Typical data:
 
 ## Admin Dashboard Explanation
 
-The admin dashboard is designed for business review, not just technical monitoring.
+The admin dashboard is designed for business review, not just technical monitoring. It benefits from the structured data produced by the feedback intelligence pipeline, including issue categories, issue tags, feedback summaries, ratings, sentiment, prompt adherence signals, and cross-conversation analytics.
 
 ### Dashboard Tab
 
@@ -242,6 +324,9 @@ Provides a high-level overview of:
 - Positive sentiment percentage
 - Task usage trends
 - Issue type distribution
+- Prompt adherence trends
+- Rating trends
+- Sentiment trends
 - Critical issue patterns
 - AI-generated insight summaries
 
@@ -253,6 +338,7 @@ Shows conversation-level records so admins can:
 - See task type, state, sentiment, rating, and issue type
 - Open a conversation detail page
 - Inspect conversation context and metadata
+- Compare how feedback evolved across the session
 
 ### Conversation Detail View
 
@@ -262,6 +348,7 @@ Lets admins inspect:
 - Prompt and AI output
 - Feedback summary
 - Positives, negatives, suggestions, and issue tags
+- Structured issue categorization and context signals
 
 ### Feedbacks Tab
 
@@ -273,6 +360,7 @@ Displays structured feedback entries in a table format so admins can quickly sca
 - Positives and negatives
 - Issue tags
 - Summary
+- Prompt adherence and quality concerns reflected in extracted feedback
 
 ### Users Tab
 
@@ -286,6 +374,7 @@ Presents aggregated AI-assisted findings such as:
 - Improvement opportunities
 - Task-wise issue breakdown
 - Frequent issue tags
+- Cross-conversation patterns in ratings, sentiment, and issue categories
 
 ## How To Use
 
